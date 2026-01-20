@@ -216,6 +216,35 @@ template <typename T> struct remove_reference<T&&> {
     using type = T;
 };
 
+// Forward declarations for tile type traits
+template <typename T, typename L> struct tile_register_t;
+template <typename T, typename L, bool Owner> struct tile_shared_t;
+
+// Type trait to detect register tiles
+template <typename T> struct is_tile_register {
+    static constexpr bool value = false;
+};
+
+template <typename T, typename L> struct is_tile_register<tile_register_t<T, L>> {
+    static constexpr bool value = true;
+};
+
+// Type trait to detect shared tiles
+template <typename T> struct is_tile_shared {
+    static constexpr bool value = false;
+};
+
+template <typename T, typename L, bool Owner> struct is_tile_shared<tile_shared_t<T, L, Owner>> {
+    static constexpr bool value = true;
+};
+
+// enable_if for SFINAE (NVRTC doesn't have std::enable_if)
+template <bool B, typename T = void> struct enable_if {};
+
+template <typename T> struct enable_if<true, T> {
+    using type = T;
+};
+
 template <int N> struct tile_coord_t {
     int indices[N];
 
@@ -5470,7 +5499,50 @@ inline CUDA_CALLABLE void adj_assign(
     }
 }
 
-template <typename TileA, typename TileB, typename Coord>
+// Specialization for register→shared tile assignment (whole tile copy, zero offset)
+// This uses the tile_shared_t::assign() method which correctly handles register tile data access
+template <typename T, typename SharedLayout, bool Owner, typename RegT, typename RegLayout>
+inline CUDA_CALLABLE void tile_assign(
+    tile_shared_t<T, SharedLayout, Owner>& dest,
+    const tile_register_t<RegT, RegLayout>& src,
+    const tile_coord_t<SharedLayout::Shape::N>& offset)
+{
+    // Check if offset is zero - if so, use the optimized assign() method
+    bool is_zero_offset = true;
+    for (int i = 0; i < SharedLayout::Shape::N; ++i) {
+        if (offset[i] != 0) {
+            is_zero_offset = false;
+            break;
+        }
+    }
+
+    if (is_zero_offset) {
+        // Use the member assign() which correctly handles register tile data access
+        dest.assign(src);
+    } else {
+        // Non-zero offset: need to do manual copy with offset
+        // This iterates over register elements and writes to shared memory at offset
+        using Layout = RegLayout;
+
+        WP_PRAGMA_UNROLL
+        for (int i = 0; i < Layout::NumRegs; ++i) {
+            const int linear = Layout::linear_from_register(i);
+
+            if (!Layout::valid(linear))
+                break;
+
+            auto c = Layout::coord_from_linear(linear);
+            dest.data(c + offset) = src.data[i];
+        }
+
+        WP_TILE_SYNC();
+    }
+}
+
+// General tile_assign for shared→shared or other cases (non-register sources)
+// SFINAE: disabled when TileB is a register tile
+template <typename TileA, typename TileB, typename Coord,
+          typename = typename std::enable_if<!is_tile_register<typename remove_reference<TileB>::type>::value>::type>
 inline CUDA_CALLABLE void tile_assign(TileA& dest, TileB& src, const Coord& offset)
 {
     using Layout = typename TileB::Layout;
@@ -5483,7 +5555,54 @@ inline CUDA_CALLABLE void tile_assign(TileA& dest, TileB& src, const Coord& offs
     WP_TILE_SYNC();
 }
 
-template <typename TileA, typename TileB, typename AdjTileA, typename AdjTileB, typename Coord, typename AdjCoord>
+// Specialization for adj_tile_assign: register→shared backward pass
+// Accumulates gradients from shared tile destination back to register tile source
+template <typename T, typename SharedLayout, bool Owner, typename RegT, typename RegLayout,
+          typename AdjT, typename AdjSharedLayout, bool AdjOwner, typename AdjRegT, typename AdjRegLayout,
+          typename Coord, typename AdjCoord>
+inline CUDA_CALLABLE void adj_tile_assign(
+    tile_shared_t<T, SharedLayout, Owner>& dest,
+    const tile_register_t<RegT, RegLayout>& src,
+    Coord offset,
+    tile_shared_t<AdjT, AdjSharedLayout, AdjOwner>& adj_dest,
+    tile_register_t<AdjRegT, AdjRegLayout>& adj_src,
+    AdjCoord adj_offset)
+{
+    // Check if offset is zero
+    bool is_zero_offset = true;
+    for (int i = 0; i < SharedLayout::Shape::N; ++i) {
+        if (offset[i] != 0) {
+            is_zero_offset = false;
+            break;
+        }
+    }
+
+    if (is_zero_offset) {
+        // Use grad_add which correctly handles register tile gradient accumulation
+        adj_dest.grad_add(adj_src);
+    } else {
+        // Non-zero offset: iterate over register elements
+        using Layout = RegLayout;
+
+        WP_PRAGMA_UNROLL
+        for (int i = 0; i < Layout::NumRegs; ++i) {
+            const int linear = Layout::linear_from_register(i);
+
+            if (!Layout::valid(linear))
+                break;
+
+            auto c = Layout::coord_from_linear(linear);
+            adj_src.data[i] += adj_dest.grad(c + offset);
+        }
+
+        WP_TILE_SYNC();
+    }
+}
+
+// General adj_tile_assign for shared→shared or other cases (non-register sources)
+// SFINAE: disabled when TileB is a register tile
+template <typename TileA, typename TileB, typename AdjTileA, typename AdjTileB, typename Coord, typename AdjCoord,
+          typename = typename std::enable_if<!is_tile_register<typename remove_reference<TileB>::type>::value>::type>
 inline CUDA_CALLABLE void
 adj_tile_assign(TileA& dest, TileB& src, Coord offset, AdjTileA& adj_dest, AdjTileB& adj_src, AdjCoord adj_offset)
 {

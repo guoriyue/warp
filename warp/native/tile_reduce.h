@@ -740,6 +740,55 @@ template <typename Tile, typename AdjTile> void adj_tile_argmin(Tile& t, Tile& a
 }
 
 
+// =============================================================================
+// Warp-level primitives exposed to Python (CUDA only)
+// =============================================================================
+
+#if defined(__CUDA_ARCH__)
+
+// Broadcast a value from lane 0 to all lanes in the warp
+template <typename T>
+inline CUDA_CALLABLE T warp_broadcast(T val)
+{
+    typedef unsigned int Word;
+    constexpr int word_count = (sizeof(T) + sizeof(Word) - 1) / sizeof(Word);
+
+    Word* src = reinterpret_cast<Word*>(&val);
+    T result;
+    Word* dest = reinterpret_cast<Word*>(&result);
+
+    WP_PRAGMA_UNROLL
+    for (int i = 0; i < word_count; ++i) {
+        dest[i] = __shfl_sync(0xFFFFFFFF, src[i], 0, WP_TILE_WARP_SIZE);
+    }
+    return result;
+}
+
+// Get the lane ID (0-31) within the current warp
+inline CUDA_CALLABLE int warp_lane_id()
+{
+    return threadIdx.x % WP_TILE_WARP_SIZE;
+}
+
+// Warp-level sum reduction - all lanes get the result
+template <typename T>
+inline CUDA_CALLABLE T warp_reduce_sum(T val)
+{
+    T sum = warp_reduce(val, [](T a, T b) { return a + b; }, 0xFFFFFFFF);
+    return warp_broadcast(sum);
+}
+
+#endif  // __CUDA_ARCH__
+
+// Adjoint stubs (needed for compilation)
+inline CUDA_CALLABLE void adj_warp_lane_id(int& adj_ret) {}
+
+template <typename T>
+inline CUDA_CALLABLE void adj_warp_reduce_sum(T val, T& adj_val, T& adj_ret)
+{
+    adj_val += adj_ret;
+}
+
 }  // namespace wp
 
 
