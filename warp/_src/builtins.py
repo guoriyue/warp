@@ -7734,6 +7734,24 @@ add_builtin(
     is_differentiable=False,
 )
 
+add_builtin(
+    "block_thread_idx",
+    input_types={},
+    value_type=int,
+    group="Utility",
+    doc="""Return the thread index within the current block (0 to block_dim-1).
+
+This function returns the calling thread's position within its block.
+Combined with ``warp_lane_id()``, this can be used to identify a thread's
+warp index within a block: ``warp_id = block_thread_idx() // 32``.
+
+.. note::
+    This is a CUDA-only feature. On CPU, this function always returns 0.""",
+    namespace="",
+    native_func="builtin_block_thread_idx",
+    is_differentiable=False,
+)
+
 # ---------------------------------
 # Warp Primitives
 

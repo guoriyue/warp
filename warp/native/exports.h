@@ -1100,6 +1100,7 @@ WP_API void wp_builtin_curlnoise_uint32_vec2f_uint32_float32_float32(uint32 stat
 WP_API void wp_builtin_curlnoise_uint32_vec3f_uint32_float32_float32(uint32 state, vec3f& xyz, uint32 octaves, float32 lacunarity, float32 gain, vec3f* ret) { *ret = wp::curlnoise(state, xyz, octaves, lacunarity, gain); }
 WP_API void wp_builtin_curlnoise_uint32_vec4f_uint32_float32_float32(uint32 state, vec4f& xyzt, uint32 octaves, float32 lacunarity, float32 gain, vec3f* ret) { *ret = wp::curlnoise(state, xyzt, octaves, lacunarity, gain); }
 WP_API void wp_builtin_block_dim(int* ret) { *ret = wp::block_dim(); }
+WP_API void wp_builtin_block_thread_idx(int* ret) { *ret = wp::block_thread_idx(); }
 WP_API void wp_builtin_extract_shape_t_int32(shape_t s, int32 i, int* ret) { *ret = wp::extract(s, i); }
 WP_API void wp_builtin_expect_eq_int8_int8(int8 a, int8 b) { wp::expect_eq(a, b); }
 WP_API void wp_builtin_expect_eq_uint8_uint8(uint8 a, uint8 b) { wp::expect_eq(a, b); }
