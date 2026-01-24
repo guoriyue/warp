@@ -238,7 +238,7 @@ template <typename T, typename L, bool Owner> struct is_tile_shared<tile_shared_
     static constexpr bool value = true;
 };
 
-// enable_if for SFINAE (NVRTC doesn't have std::enable_if)
+// enable_if for SFINAE (NVRTC doesn't have enable_if)
 template <bool B, typename T = void> struct enable_if {};
 
 template <typename T> struct enable_if<true, T> {
@@ -5542,7 +5542,7 @@ inline CUDA_CALLABLE void tile_assign(
 // General tile_assign for shared→shared or other cases (non-register sources)
 // SFINAE: disabled when TileB is a register tile
 template <typename TileA, typename TileB, typename Coord,
-          typename = typename std::enable_if<!is_tile_register<typename remove_reference<TileB>::type>::value>::type>
+          typename = typename enable_if<!is_tile_register<typename remove_reference<TileB>::type>::value>::type>
 inline CUDA_CALLABLE void tile_assign(TileA& dest, TileB& src, const Coord& offset)
 {
     using Layout = typename TileB::Layout;
@@ -5602,7 +5602,7 @@ inline CUDA_CALLABLE void adj_tile_assign(
 // General adj_tile_assign for shared→shared or other cases (non-register sources)
 // SFINAE: disabled when TileB is a register tile
 template <typename TileA, typename TileB, typename AdjTileA, typename AdjTileB, typename Coord, typename AdjCoord,
-          typename = typename std::enable_if<!is_tile_register<typename remove_reference<TileB>::type>::value>::type>
+          typename = typename enable_if<!is_tile_register<typename remove_reference<TileB>::type>::value>::type>
 inline CUDA_CALLABLE void
 adj_tile_assign(TileA& dest, TileB& src, Coord offset, AdjTileA& adj_dest, AdjTileB& adj_src, AdjCoord adj_offset)
 {

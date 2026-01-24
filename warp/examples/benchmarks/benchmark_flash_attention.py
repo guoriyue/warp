@@ -3,14 +3,17 @@
 
 """Flash Attention Benchmark.
 
-Benchmarks four implementations:
-- naive: 3-pass attention (baseline)
-- scalar: online softmax (memory efficient)
-- simd: warp-parallel with warp_reduce_sum
-- tiled: tile_matmul-based FlashAttention (tensor cores + SRAM)
+Benchmarks implementations:
+- naive: 3-pass attention (Warp baseline)
+- flash_attn: official Flash Attention library (if installed)
+
+Note: Tiled/SIMD kernels disabled due to wp.launch_tiled bug in Warp 1.12.0.dev0
 
 Usage:
     python benchmark_flash_attention.py
+
+To include official flash_attn comparison:
+    pip install flash-attn --no-build-isolation
 """
 
 import sys
@@ -18,21 +21,26 @@ import time
 from statistics import mean
 
 import numpy as np
+import torch
 import warp as wp
+
+# Try to import official flash_attn library
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+    print("Warning: flash_attn not installed. Install with: pip install flash-attn --no-build-isolation")
 
 sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
 from tile.example_tile_flash_attention import (
     get_naive_kernel,
-    get_flash_kernel,
-    get_simd_kernel,
-    get_tiled_kernel,
     reference_attention,
-    TILE_M,
-    TILE_N,
-    TILE_THREADS,
 )
 
-IMPLEMENTATIONS = ["naive", "scalar", "simd", "tiled"]
+IMPLEMENTATIONS = ["naive"]
+if HAS_FLASH_ATTN:
+    IMPLEMENTATIONS.append("flash_attn")
 
 DISTRIBUTIONS = {
     "uniform": lambda shape, rng: rng.uniform(-1, 1, shape).astype(np.float32),
@@ -46,31 +54,11 @@ RTOL = 5e-2
 ATOL = 1e-5
 
 
-def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array, sm_scale: float, head_dim: int,
-                  Q_tiled: wp.array = None, K_tiled: wp.array = None, V_tiled: wp.array = None, O_tiled: wp.array = None):
+def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array, sm_scale: float, head_dim: int):
     batch_heads, seq_len, _ = Q.shape
     if impl == "naive":
         kernel = get_naive_kernel(head_dim)
         wp.launch(kernel, dim=(seq_len, batch_heads), inputs=[Q, K, V, O, sm_scale, seq_len])
-    elif impl == "scalar":
-        kernel = get_flash_kernel(head_dim)
-        wp.launch(kernel, dim=(seq_len, batch_heads), inputs=[Q, K, V, O, sm_scale, seq_len])
-    elif impl == "simd":
-        kernel = get_simd_kernel(head_dim)
-        wp.launch_tiled(kernel, dim=seq_len * batch_heads, inputs=[Q, K, V, O, sm_scale, seq_len, batch_heads], block_dim=32)
-    elif impl == "tiled":
-        kernel = get_tiled_kernel(head_dim)
-        # Tiled kernel uses 3D arrays with batch_heads dimension
-        padded_seq = ((seq_len + TILE_M - 1) // TILE_M) * TILE_M
-        num_q_blocks = padded_seq // TILE_M
-        num_k_blocks = padded_seq // TILE_N
-        num_tiles = batch_heads * num_q_blocks
-        wp.launch_tiled(
-            kernel,
-            dim=num_tiles,
-            inputs=[Q_tiled, K_tiled, V_tiled, O_tiled, sm_scale, padded_seq, batch_heads, num_q_blocks, num_k_blocks],
-            block_dim=TILE_THREADS,
-        )
 
 
 def validate(result: np.ndarray, reference: np.ndarray) -> tuple[bool, float]:
@@ -98,45 +86,50 @@ def benchmark(batch: int, heads: int, seq_len: int, impl: str, head_dim: int = 6
     V_4d = V_np.reshape(batch, heads, seq_len, head_dim)
     ref_out = reference_attention(Q_4d, K_4d, V_4d, sm_scale).reshape(shape)
 
+    # Handle official flash_attn library separately (uses PyTorch)
+    if impl == "flash_attn":
+        # flash_attn_func expects (batch, seq_len, num_heads, head_dim) in FP16/BF16
+        Q_torch = torch.from_numpy(Q_4d.transpose(0, 2, 1, 3)).cuda().half()  # (B, S, H, D)
+        K_torch = torch.from_numpy(K_4d.transpose(0, 2, 1, 3)).cuda().half()
+        V_torch = torch.from_numpy(V_4d.transpose(0, 2, 1, 3)).cuda().half()
+
+        # Warmup
+        for _ in range(warmup):
+            _ = flash_attn_func(Q_torch, K_torch, V_torch, softmax_scale=sm_scale)
+        torch.cuda.synchronize()
+
+        # Benchmark
+        timings = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            O_torch = flash_attn_func(Q_torch, K_torch, V_torch, softmax_scale=sm_scale)
+            torch.cuda.synchronize()
+            timings.append((time.perf_counter() - start) * 1000)
+
+        time_ms = mean(timings)
+        # Convert back: (B, S, H, D) -> (B, H, S, D) -> (B*H, S, D)
+        O_result = O_torch.float().cpu().numpy().transpose(0, 2, 1, 3).reshape(shape)
+        passed, error = validate(O_result, ref_out)
+        return time_ms, error, passed
+
     Q = wp.array(Q_np, dtype=float)
     K = wp.array(K_np, dtype=float)
     V = wp.array(V_np, dtype=float)
     O = wp.zeros_like(Q)
 
-    # Prepare padded arrays for tiled implementation
-    Q_tiled, K_tiled, V_tiled, O_tiled = None, None, None, None
-    if impl == "tiled":
-        padded_seq = ((seq_len + TILE_M - 1) // TILE_M) * TILE_M
-        Q_padded_np = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        K_padded_np = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        V_padded_np = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        Q_padded_np[:, :seq_len, :] = Q_np
-        K_padded_np[:, :seq_len, :] = K_np
-        V_padded_np[:, :seq_len, :] = V_np
-        Q_tiled = wp.array(Q_padded_np, dtype=float)
-        K_tiled = wp.array(K_padded_np, dtype=float)
-        V_tiled = wp.array(V_padded_np, dtype=float)
-        O_tiled = wp.zeros_like(Q_tiled)
-
     for _ in range(warmup):
-        launch_kernel(impl, Q, K, V, O, sm_scale, head_dim, Q_tiled, K_tiled, V_tiled, O_tiled)
+        launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
     wp.synchronize()
 
     timings = []
     for _ in range(iterations):
         start = time.perf_counter()
-        launch_kernel(impl, Q, K, V, O, sm_scale, head_dim, Q_tiled, K_tiled, V_tiled, O_tiled)
+        launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
         wp.synchronize()
         timings.append((time.perf_counter() - start) * 1000)
 
     time_ms = mean(timings)
-
-    # For tiled, extract non-padded output from 3D array
-    if impl == "tiled":
-        O_result = O_tiled.numpy()[:, :seq_len, :]
-        passed, error = validate(O_result, ref_out)
-    else:
-        passed, error = validate(O.numpy(), ref_out)
+    passed, error = validate(O.numpy(), ref_out)
 
     return time_ms, error, passed
 
@@ -162,7 +155,7 @@ def run_correctness_benchmarks():
             for impl in IMPLEMENTATIONS:
                 _, error, passed = benchmark(batch, heads, seq_len, impl, head_dim, dist, warmup=1, iterations=1)
                 status = "PASS" if passed else "FAIL"
-                print(f"[{status}] {impl:6} B={batch} H={heads} S={seq_len:4} D={head_dim:3} {dist:8} err={error:.2e}")
+                print(f"[{status}] {impl:10} B={batch} H={heads} S={seq_len:4} D={head_dim:3} {dist:8} err={error:.2e}")
                 if not passed:
                     all_passed = False
 
@@ -171,9 +164,11 @@ def run_correctness_benchmarks():
 
 
 def run_scaling_benchmarks():
-    print("\n" + "=" * 60)
+    base_width = 22  # naive only
+    width = base_width + 14 if HAS_FLASH_ATTN else base_width
+    print("\n" + "=" * width)
     print("SCALING BENCHMARKS (head_dim=64)")
-    print("=" * 60)
+    print("=" * width)
 
     seq_lengths = [128, 256, 512, 1024, 2048]
     batch_heads = [(1, 8), (4, 8)]
@@ -181,15 +176,21 @@ def run_scaling_benchmarks():
 
     for batch, heads in batch_heads:
         print(f"\nBatch={batch}, Heads={heads}, HeadDim={head_dim}")
-        print(f"{'SeqLen':<8} {'naive':>12} {'scalar':>12} {'simd':>12} {'tiled':>12}")
-        print("-" * 60)
+        header = f"{'SeqLen':<8} {'naive':>12}"
+        if HAS_FLASH_ATTN:
+            header += f" {'flash_attn':>12}"
+        print(header)
+        print("-" * width)
 
         for seq_len in seq_lengths:
             times = {}
             for impl in IMPLEMENTATIONS:
                 time_ms, _, _ = benchmark(batch, heads, seq_len, impl, head_dim)
                 times[impl] = time_ms
-            print(f"{seq_len:<8} {times['naive']:>10.3f}ms {times['scalar']:>10.3f}ms {times['simd']:>10.3f}ms {times['tiled']:>10.3f}ms")
+            row = f"{seq_len:<8} {times['naive']:>10.3f}ms"
+            if HAS_FLASH_ATTN:
+                row += f" {times['flash_attn']:>10.3f}ms"
+            print(row)
 
 
 def run_distribution_benchmarks():
@@ -203,7 +204,7 @@ def run_distribution_benchmarks():
         for impl in IMPLEMENTATIONS:
             time_ms, error, passed = benchmark(4, 8, 512, impl, head_dim, dist)
             status = "PASS" if passed else "FAIL"
-            print(f"  {impl:6}: {time_ms:8.3f}ms  err={error:.2e}  [{status}]")
+            print(f"  {impl:10}: {time_ms:8.3f}ms  err={error:.2e}  [{status}]")
 
 def main():
     wp.init()

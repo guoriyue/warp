@@ -6,9 +6,11 @@ Flash Attention v2 implementation in Warp.
 
 Implementations:
 1. Naive 3-pass attention (baseline)
-2. Flash Attention with online softmax (memory efficient)
-3. Flash Attention SIMD - 32 threads cooperate per query
-4. Flash Attention tiled - tile_matmul based (tensor cores + SRAM)
+2. Flash Attention SIMD - 32 threads cooperate per query (disabled: wp.launch_tiled bug)
+3. Flash Attention tiled - tile_matmul based (disabled: wp.launch_tiled bug)
+
+Note: SIMD and tiled kernels require wp.launch_tiled which has a compilation bug
+in Warp 1.12.0.dev0 (std::enable_if not available in NVRTC).
 
 Supports head dimensions: 32, 64, 128, 256
 Input shape: [batch_heads, seq_len, head_dim]
@@ -98,57 +100,6 @@ def create_naive_attention_kernel(head_dim: int):
     return naive_attention_kernel
 
 
-def create_flash_attention_kernel(head_dim: int):
-    """Factory to create flash attention kernel for specific head_dim."""
-    @wp.kernel(enable_backward=False)
-    def flash_attention_kernel(
-        Q: wp.array3d(dtype=float),
-        K: wp.array3d(dtype=float),
-        V: wp.array3d(dtype=float),
-        O: wp.array3d(dtype=float),
-        sm_scale: float,
-        seq_len: int,
-    ):
-        """Flash Attention with online softmax."""
-        query_idx, batch_head = wp.tid()
-        if query_idx >= seq_len:
-            return
-
-        HEAD_DIM_LOCAL = wp.static(head_dim)
-
-        m_i = float(NEG_INF)
-        l_i = float(0.0)
-
-        acc = wp.vector(dtype=float, length=HEAD_DIM_LOCAL)
-        for d in range(HEAD_DIM_LOCAL):
-            acc[d] = float(0.0)
-
-        q = wp.vector(dtype=float, length=HEAD_DIM_LOCAL)
-        for d in range(HEAD_DIM_LOCAL):
-            q[d] = Q[batch_head, query_idx, d]
-
-        for k_idx in range(seq_len):
-            qk = float(0.0)
-            for d in range(HEAD_DIM_LOCAL):
-                qk += q[d] * K[batch_head, k_idx, d]
-            qk = qk * sm_scale
-
-            m_new = wp.max(m_i, qk)
-            alpha = wp.exp(m_i - m_new)
-            p = wp.exp(qk - m_new)
-            l_i = l_i * alpha + p
-
-            for d in range(HEAD_DIM_LOCAL):
-                acc[d] = acc[d] * alpha + p * V[batch_head, k_idx, d]
-
-            m_i = m_new
-
-        for d in range(HEAD_DIM_LOCAL):
-            O[batch_head, query_idx, d] = acc[d] / l_i
-
-    return flash_attention_kernel
-
-
 def create_flash_attention_simd_kernel(head_dim: int):
     """Factory to create SIMD flash attention kernel for specific head_dim."""
     d_per_lane = head_dim // 32  # 32 threads per warp
@@ -228,16 +179,6 @@ def get_naive_kernel(head_dim: int):
         if head_dim not in SUPPORTED_HEAD_DIMS:
             raise ValueError(f"head_dim={head_dim} not supported. Use one of {SUPPORTED_HEAD_DIMS}")
         _kernel_cache[key] = create_naive_attention_kernel(head_dim)
-    return _kernel_cache[key]
-
-
-def get_flash_kernel(head_dim: int):
-    """Get or create flash attention kernel for head_dim."""
-    key = ("flash", head_dim)
-    if key not in _kernel_cache:
-        if head_dim not in SUPPORTED_HEAD_DIMS:
-            raise ValueError(f"head_dim={head_dim} not supported. Use one of {SUPPORTED_HEAD_DIMS}")
-        _kernel_cache[key] = create_flash_attention_kernel(head_dim)
     return _kernel_cache[key]
 
 
@@ -435,16 +376,6 @@ if __name__ == "__main__":
         err = np.max(np.abs(O.numpy() - ref_out))
         status = "PASS" if err < 1e-5 else "FAIL"
         print(f"  Naive:      err={err:.2e} [{status}]")
-        if status == "FAIL":
-            all_passed = False
-
-        # Test flash kernel (online softmax)
-        flash_kernel = get_flash_kernel(head_dim)
-        O = wp.zeros_like(Q)
-        wp.launch(flash_kernel, dim=(seq_len, batch_heads), inputs=[Q, K, V, O, sm_scale, seq_len])
-        err = np.max(np.abs(O.numpy() - ref_out))
-        status = "PASS" if err < 1e-5 else "FAIL"
-        print(f"  Flash:      err={err:.2e} [{status}]")
         if status == "FAIL":
             all_passed = False
 
