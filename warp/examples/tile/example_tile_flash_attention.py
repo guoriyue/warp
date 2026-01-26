@@ -6,11 +6,8 @@ Flash Attention v2 implementation in Warp.
 
 Implementations:
 1. Naive 3-pass attention (baseline)
-2. Flash Attention SIMD - 32 threads cooperate per query (disabled: wp.launch_tiled bug)
-3. Flash Attention tiled - tile_matmul based (disabled: wp.launch_tiled bug)
-
-Note: SIMD and tiled kernels require wp.launch_tiled which has a compilation bug
-in Warp 1.12.0.dev0 (std::enable_if not available in NVRTC).
+2. Flash Attention tiled FP32 - tile_matmul based (tensor cores + SRAM)
+3. Flash Attention tiled FP16 - tile_matmul based (tensor cores + SRAM, half precision)
 
 Supports head dimensions: 32, 64, 128, 256
 Input shape: [batch_heads, seq_len, head_dim]
@@ -23,15 +20,14 @@ import warp as wp
 NEG_INF = wp.constant(-1.0e10)
 
 # Default tile sizes for tile_matmul-based flash attention
-TILE_M = 16    # Query block size
-TILE_N = 16    # Key/Value block size
-TILE_THREADS = 64  # Threads per block for tile operations
-
+TILE_M = 64
+TILE_N = 64
+TILE_THREADS = 256
 # Supported head dimensions
 SUPPORTED_HEAD_DIMS = [32, 64, 128, 256]
 
 
-# Helper functions for tile_map operations
+# Helper functions for tile_map operations (FP32)
 @wp.func
 def mul_func(a: float, b: float) -> float:
     return a * b
@@ -39,6 +35,17 @@ def mul_func(a: float, b: float) -> float:
 
 @wp.func
 def div_func(a: float, b: float) -> float:
+    return a / b
+
+
+# Helper functions for tile_map operations (FP16)
+@wp.func
+def mul_func_f16(a: wp.float16, b: wp.float16) -> wp.float16:
+    return a * b
+
+
+@wp.func
+def div_func_f16(a: wp.float16, b: wp.float16) -> wp.float16:
     return a / b
 
 
@@ -100,71 +107,6 @@ def create_naive_attention_kernel(head_dim: int):
     return naive_attention_kernel
 
 
-def create_flash_attention_simd_kernel(head_dim: int):
-    """Factory to create SIMD flash attention kernel for specific head_dim."""
-    d_per_lane = head_dim // 32  # 32 threads per warp
-
-    @wp.kernel(enable_backward=False)
-    def flash_attention_simd_kernel(
-        Q: wp.array3d(dtype=float),
-        K: wp.array3d(dtype=float),
-        V: wp.array3d(dtype=float),
-        O: wp.array3d(dtype=float),
-        sm_scale: float,
-        seq_len: int,
-        batch_heads: int,
-    ):
-        """Flash Attention SIMD - 32 threads cooperate per query via warp_reduce_sum."""
-        work_idx = wp.tid()
-        lane_id = wp.warp_lane_id()
-
-        query_idx = work_idx % seq_len
-        batch_head = work_idx // seq_len
-        if batch_head >= batch_heads:
-            return
-
-        D_PER_LANE_LOCAL = wp.static(d_per_lane)
-        d_start = lane_id * D_PER_LANE_LOCAL
-
-        # Load Q elements for this lane
-        q_local = wp.vector(dtype=float, length=D_PER_LANE_LOCAL)
-        for i in range(D_PER_LANE_LOCAL):
-            q_local[i] = Q[batch_head, query_idx, d_start + i]
-
-        m_i = float(NEG_INF)
-        l_i = float(0.0)
-        acc_local = wp.vector(dtype=float, length=D_PER_LANE_LOCAL)
-        for i in range(D_PER_LANE_LOCAL):
-            acc_local[i] = float(0.0)
-
-        for k_idx in range(seq_len):
-            # Load K elements and compute partial dot product
-            partial_qk = float(0.0)
-            for i in range(D_PER_LANE_LOCAL):
-                k_val = K[batch_head, k_idx, d_start + i]
-                partial_qk += q_local[i] * k_val
-
-            qk_val = wp.warp_reduce_sum(partial_qk) * sm_scale
-
-            m_new = wp.max(m_i, qk_val)
-            alpha = wp.exp(m_i - m_new)
-            p = wp.exp(qk_val - m_new)
-            l_i = l_i * alpha + p
-
-            # Load V elements and accumulate
-            for i in range(D_PER_LANE_LOCAL):
-                v_val = V[batch_head, k_idx, d_start + i]
-                acc_local[i] = acc_local[i] * alpha + p * v_val
-
-            m_i = m_new
-
-        # Write output
-        for i in range(D_PER_LANE_LOCAL):
-            O[batch_head, query_idx, d_start + i] = acc_local[i] / l_i
-
-    return flash_attention_simd_kernel
-
-
 # =============================================================================
 # Kernel cache for different head dimensions
 # =============================================================================
@@ -179,18 +121,6 @@ def get_naive_kernel(head_dim: int):
         if head_dim not in SUPPORTED_HEAD_DIMS:
             raise ValueError(f"head_dim={head_dim} not supported. Use one of {SUPPORTED_HEAD_DIMS}")
         _kernel_cache[key] = create_naive_attention_kernel(head_dim)
-    return _kernel_cache[key]
-
-
-def get_simd_kernel(head_dim: int):
-    """Get or create SIMD flash attention kernel for head_dim."""
-    key = ("simd", head_dim)
-    if key not in _kernel_cache:
-        if head_dim not in SUPPORTED_HEAD_DIMS:
-            raise ValueError(f"head_dim={head_dim} not supported. Use one of {SUPPORTED_HEAD_DIMS}")
-        if head_dim % 32 != 0:
-            raise ValueError(f"head_dim={head_dim} must be divisible by 32 for SIMD kernel")
-        _kernel_cache[key] = create_flash_attention_simd_kernel(head_dim)
     return _kernel_cache[key]
 
 
@@ -243,12 +173,13 @@ def create_flash_attention_tiled_kernel(head_dim: int, tile_m: int = 16, tile_n:
         Q_tile_3d = wp.tile_load(Q, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, q_start, 0))
         Q_tile = wp.tile_squeeze(Q_tile_3d, axis=(0,))
 
-        # Initialize output accumulator in SRAM
-        O_acc = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=float, storage="shared")
+        # Initialize output accumulator in registers (distributed across threads)
+        # Using registers instead of shared memory to reduce SRAM usage
+        O_acc = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=float)
 
-        # Initialize online softmax state per row in SRAM
-        m_i = wp.tile_full(shape=(TILE_M_LOCAL, 1), value=float(NEG_INF), dtype=float, storage="shared")
-        l_i = wp.tile_zeros(shape=(TILE_M_LOCAL, 1), dtype=float, storage="shared")
+        # Initialize online softmax state per row in registers
+        m_i = wp.tile_full(shape=(TILE_M_LOCAL, 1), value=float(NEG_INF), dtype=float)
+        l_i = wp.tile_zeros(shape=(TILE_M_LOCAL, 1), dtype=float)
 
         # Iterate over K/V blocks (outer loop in FlashAttention paper)
         for k_block in range(num_k_blocks):
@@ -325,6 +256,93 @@ def get_tiled_kernel(head_dim: int, tile_m: int = 16, tile_n: int = 16):
     return _kernel_cache[key]
 
 
+def create_flash_attention_tiled_f16_kernel(head_dim: int, tile_m: int = 16, tile_n: int = 16):
+    """Factory to create FP16 tiled flash attention kernel - same as FP32 but with fp16 dtype."""
+    NEG_INF_F16 = wp.float16(-65504.0)
+
+    @wp.kernel(enable_backward=False)
+    def flash_attention_tiled_f16_kernel(
+        Q: wp.array3d(dtype=wp.float16),
+        K: wp.array3d(dtype=wp.float16),
+        V: wp.array3d(dtype=wp.float16),
+        O: wp.array3d(dtype=wp.float16),
+        sm_scale: wp.float16,
+        seq_len: int,
+        batch_heads: int,
+        num_q_blocks: int,
+        num_k_blocks: int,
+    ):
+        TILE_M_LOCAL = wp.static(tile_m)
+        TILE_N_LOCAL = wp.static(tile_n)
+        HEAD_DIM_LOCAL = wp.static(head_dim)
+
+        tile_idx = wp.tid()
+        batch_head = tile_idx // num_q_blocks
+        q_block_idx = tile_idx % num_q_blocks
+        q_start = q_block_idx * TILE_M_LOCAL
+
+        if batch_head >= batch_heads:
+            return
+
+        Q_tile_3d = wp.tile_load(Q, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, q_start, 0))
+        Q_tile = wp.tile_squeeze(Q_tile_3d, axis=(0,))
+
+        O_acc = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=wp.float16, storage="shared")
+        m_i = wp.tile_full(shape=(TILE_M_LOCAL, 1), value=NEG_INF_F16, dtype=wp.float16, storage="shared")
+        l_i = wp.tile_zeros(shape=(TILE_M_LOCAL, 1), dtype=wp.float16, storage="shared")
+
+        for k_block in range(num_k_blocks):
+            k_start = k_block * TILE_N_LOCAL
+
+            K_tile_3d = wp.tile_load(K, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0), storage="shared")
+            K_tile = wp.tile_squeeze(K_tile_3d, axis=(0,))
+            V_tile_3d = wp.tile_load(V, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0), storage="shared")
+            V_tile = wp.tile_squeeze(V_tile_3d, axis=(0,))
+
+            K_T = wp.tile_transpose(K_tile)
+            S = wp.tile_zeros(shape=(TILE_M_LOCAL, TILE_N_LOCAL), dtype=wp.float16)
+            wp.tile_matmul(Q_tile, K_T, S)
+            S = S * sm_scale
+
+            m_block = wp.tile_reduce(wp.max, S, axis=1)
+            m_block = wp.tile_reshape(m_block, shape=(TILE_M_LOCAL, 1))
+            m_new = wp.tile_map(wp.max, m_i, m_block)
+
+            alpha = wp.tile_map(wp.exp, m_i - m_new)
+            m_broadcast = wp.tile_broadcast(m_new, shape=(TILE_M_LOCAL, TILE_N_LOCAL))
+            P = wp.tile_map(wp.exp, S - m_broadcast)
+
+            l_block = wp.tile_sum(P, axis=1)
+            l_block = wp.tile_reshape(l_block, shape=(TILE_M_LOCAL, 1))
+            l_new = wp.tile_map(mul_func_f16, l_i, alpha) + l_block
+            wp.tile_assign(l_i, l_new)
+
+            alpha_broadcast = wp.tile_broadcast(alpha, shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL))
+            O_scaled = wp.tile_map(mul_func_f16, O_acc, alpha_broadcast)
+            wp.tile_assign(O_acc, O_scaled)
+
+            wp.tile_matmul(P, V_tile, O_acc)
+            wp.tile_assign(m_i, m_new)
+
+        l_broadcast = wp.tile_broadcast(l_i, shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL))
+        O_final = wp.tile_map(div_func_f16, O_acc, l_broadcast)
+
+        O_final_3d = wp.tile_reshape(O_final, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL))
+        wp.tile_store(O, O_final_3d, offset=(batch_head, q_start, 0))
+
+    return flash_attention_tiled_f16_kernel
+
+
+def get_tiled_kernel_f16(head_dim: int, tile_m: int = 16, tile_n: int = 16):
+    """Get or create FP16 tiled flash attention kernel for head_dim."""
+    key = ("tiled_f16", head_dim, tile_m, tile_n)
+    if key not in _kernel_cache:
+        if head_dim not in SUPPORTED_HEAD_DIMS:
+            raise ValueError(f"head_dim={head_dim} not supported. Use one of {SUPPORTED_HEAD_DIMS}")
+        _kernel_cache[key] = create_flash_attention_tiled_f16_kernel(head_dim, tile_m, tile_n)
+    return _kernel_cache[key]
+
+
 def reference_attention(Q, K, V, sm_scale):
     """NumPy reference."""
     QK = np.matmul(Q, K.transpose(0, 1, 3, 2)) * sm_scale
@@ -379,19 +397,10 @@ if __name__ == "__main__":
         if status == "FAIL":
             all_passed = False
 
-        # Test SIMD kernel (warp-parallel)
-        simd_kernel = get_simd_kernel(head_dim)
-        O = wp.zeros_like(Q)
-        wp.launch_tiled(simd_kernel, dim=seq_len * batch_heads, inputs=[Q, K, V, O, sm_scale, seq_len, batch_heads], block_dim=32)
-        err = np.max(np.abs(O.numpy() - ref_out))
-        status = "PASS" if err < 1e-5 else "FAIL"
-        print(f"  SIMD:       err={err:.2e} [{status}]")
-        if status == "FAIL":
-            all_passed = False
-
         # Test tiled kernel (tile_matmul based, FlashAttention style)
-        tiled_kernel = get_tiled_kernel(head_dim)
         tile_m, tile_n = TILE_M, TILE_N
+        tiled_kernel = get_tiled_kernel(head_dim, tile_m, tile_n)
+        print(f"    Using TILE_M={tile_m}, TILE_N={tile_n}")
         padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
         num_q_blocks = padded_seq // tile_m
         num_k_blocks = padded_seq // tile_n

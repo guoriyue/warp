@@ -46,34 +46,32 @@ template <typename T> int argmin_tracker(T champion_value, T current_value, int 
 template <typename T> inline CUDA_CALLABLE T warp_shuffle_down(T val, int offset, int mask)
 {
     typedef unsigned int Word;
-
-    union {
-        T output;
-        Word output_storage;
-    };
-
-    union {
-        T input;
-        Word input_storage;
-    };
-
-    input = val;
-
-    Word* dest = reinterpret_cast<Word*>(&output);
-    Word* src = reinterpret_cast<Word*>(&input);
-
-    unsigned int shuffle_word;
-
     constexpr int word_count = (sizeof(T) + sizeof(Word) - 1) / sizeof(Word);
+
+    // Use Word arrays + reinterpret_cast instead of unions to avoid issues
+    // with types that have non-trivial constructors (e.g., half/float16)
+    Word src[word_count];
+    Word dest[word_count];
+
+    *reinterpret_cast<T*>(src) = val;
 
     WP_PRAGMA_UNROLL
     for (int i = 0; i < word_count; ++i) {
-        shuffle_word = __shfl_down_sync(mask, src[i], offset, WP_TILE_WARP_SIZE);
-        dest[i] = shuffle_word;
+        dest[i] = __shfl_down_sync(mask, src[i], offset, WP_TILE_WARP_SIZE);
     }
 
-    return output;
+    return *reinterpret_cast<T*>(dest);
 }
+
+// // float16 (half) specialization - shuffle via bit reinterpretation
+// template <>
+// inline CUDA_CALLABLE half warp_shuffle_down<half>(half val, int offset, int mask)
+// {
+//     unsigned short bits = *reinterpret_cast<unsigned short*>(&val);
+//     unsigned int shuffled = __shfl_down_sync(static_cast<unsigned int>(mask), static_cast<unsigned int>(bits), offset, WP_TILE_WARP_SIZE);
+//     unsigned short result = static_cast<unsigned short>(shuffled);
+//     return *reinterpret_cast<half*>(&result);
+// }
 
 // vector overload
 template <unsigned Length, typename T>

@@ -713,6 +713,8 @@ class Var:
         self.is_read = False
         # records whether this Var has been written to in a kernel function (array only)
         self.is_write = False
+        # set by IR builder: True if var was defined inside a loop (for scoped tile allocation)
+        self.in_loop = False
 
         # used to associate a view array Var with its parent array Var
         self.parent = None
@@ -1092,17 +1094,26 @@ class Adjoint:
     def alloc_shared_extra(adj, num_bytes):
         adj.max_required_extra_shared_memory = max(adj.max_required_extra_shared_memory, num_bytes)
 
-    # returns the total number of bytes for a function
-    # based on it's own requirements + worst case
-    # requirements of any dependent functions
+    # returns the peak shared memory bytes for a function
+    # loop-local tiles are scoped and freed at loop end
+    # tiles of same size within loop can share memory (sequential reuse)
     def get_total_required_shared(adj):
-        total_shared = 0
+        persistent_shared = 0
+        loop_local_sizes = {}  # group by size, count unique sizes
 
         for var in adj.variables:
             if is_tile(var.type) and var.type.storage == "shared" and var.type.owner:
-                total_shared += var.type.size_in_bytes()
+                size = var.type.size_in_bytes()
+                if var.in_loop:
+                    # tiles of same size can share memory via stack allocator
+                    loop_local_sizes[size] = loop_local_sizes.get(size, 0) + 1
+                else:
+                    persistent_shared += size
 
-        return total_shared + adj.max_required_extra_shared_memory
+        # for loop-local: assume tiles of same size reuse memory (at most 2 live at once)
+        loop_local_shared = sum(size * min(count, 2) for size, count in loop_local_sizes.items())
+
+        return persistent_shared + loop_local_shared + adj.max_required_extra_shared_memory
 
     @staticmethod
     def extract_function_source(func: Callable) -> tuple[str, int]:
@@ -1292,6 +1303,9 @@ class Adjoint:
 
         # allocate new variable
         v = Var(name, type=type, constant=constant, relative_lineno=adj.lineno)
+
+        # mark if defined inside a loop (for scoped tile allocation)
+        v.in_loop = len(adj.loop_blocks) > 0
 
         adj.variables.append(v)
 
@@ -1911,8 +1925,22 @@ class Adjoint:
         for i in cond_block.body_forward:
             adj.blocks[-1].body_forward.append(i)
 
+        # collect loop-local shared tiles that need scoped allocation
+        loop_local_tiles = [v for v in body_block.vars if is_tile(v.type) and v.type.storage == "shared" and v.type.owner]
+
+        if loop_local_tiles:
+            # open scope for loop body (tiles will be freed at scope end)
+            adj.blocks[-1].body_forward.append(adj.indentation + "{")
+            # emit tile declarations at start of scope
+            for var in loop_local_tiles:
+                adj.blocks[-1].body_forward.append(adj.indentation + f"{var.ctype()} {var.emit()} = {var.type.cinit(requires_grad=False)};")
+
         for i in body_block.body_forward:
             adj.blocks[-1].body_forward.append(i)
+
+        if loop_local_tiles:
+            # close scope (destructors will free tiles)
+            adj.blocks[-1].body_forward.append(adj.indentation + "}")
 
         adj.add_forward(f"goto start_{cond_block.label};", skip_replay=True)
 
@@ -4292,20 +4320,27 @@ def codegen_func_forward(adj, func_type="kernel", device="cpu"):
         for var in adj.args:
             lines += [f"{var.ctype()} {var.emit()} = _wp_args->{var.label};\n"]
 
-    # primal vars
+    # primal vars (skip loop-local tiles - they're declared inside the loop via end_for)
     lines += ["//---------\n"]
     lines += ["// primal vars\n"]
 
     for var in adj.variables:
         if is_tile(var.type):
-            lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit(requires_grad=False)};\n"]
+            if var.in_loop and var.type.storage == "shared" and var.type.owner:
+                # skip - shared loop-local tiles are declared inside the loop body with scoping (see end_for)
+                pass
+            else:
+                lines += [f"{var.ctype()} {var.emit()} = {var.type.cinit(requires_grad=False)};\n"]
+                if line_directive := adj.get_line_directive(lines[-1], var.relative_lineno):
+                    lines.insert(-1, f"{line_directive}\n")
         elif var.constant is None:
             lines += [f"{var.ctype()} {var.emit()};\n"]
+            if line_directive := adj.get_line_directive(lines[-1], var.relative_lineno):
+                lines.insert(-1, f"{line_directive}\n")
         else:
             lines += [f"const {var.ctype()} {var.emit()} = {constant_str(var.constant)};\n"]
-
-        if line_directive := adj.get_line_directive(lines[-1], var.relative_lineno):
-            lines.insert(-1, f"{line_directive}\n")
+            if line_directive := adj.get_line_directive(lines[-1], var.relative_lineno):
+                lines.insert(-1, f"{line_directive}\n")
 
     # forward pass
     lines += ["//---------\n"]
