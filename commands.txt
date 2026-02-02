@@ -19,3 +19,33 @@ SeqLen          naive        tiled    tiled_f16       triton   flash_attn
 1024         11.616ms      0.113ms      0.098ms      0.120ms      0.052ms
 2048         23.329ms      0.353ms      0.200ms      0.181ms      0.128ms
 4096           skip      1.150ms      0.619ms      0.474ms      0.424ms
+
+
+
+
+256         1.709ms e=0e+00    0.139ms e=0e+00    0.141ms e=0e+00    0.055ms e=0e+00
+Module tile.example_tile_flash_attention 1b64b67 load on device 'cuda:0' took 23628.24 ms  (compiled)
+512         3.383ms e=0e+00    0.278ms e=0e+00    0.268ms e=0e+00    0.062ms e=0e+00
+1024        6.733ms e=0e+00    0.963ms e=0e+00    0.513ms e=0e+00    0.068ms e=0e+00
+2048       12.342ms e=0e+00    2.822ms e=0e+00    1.770ms e=0e+00    0.099ms e=0e+00
+4096       26.758ms e=0e+00    9.144ms e=0e+00    5.391ms e=0e+00    0.269ms e=0e+00
+8192       94.527ms e=0e+00   32.935ms e=0e+00   18.351ms e=0e+00    0.870ms e=0e+00
+
+Batch=2, Heads=8, HeadDim=64
+SeqLen                naive              tiled          tiled_f16             triton
+----------------------------------------------------------------------------------------------------
+256         3.009ms e=0e+00    0.139ms e=0e+00    0.135ms e=0e+00    0.053ms e=0e+00
+512         6.091ms e=0e+00    0.464ms e=0e+00    0.260ms e=0e+00    0.062ms e=0e+00
+1024       13.253ms e=0e+00    1.479ms e=0e+00    0.934ms e=0e+00    0.088ms e=0e+00
+2048       25.297ms e=0e+00    4.617ms e=0e+00    2.729ms e=0e+00    0.166ms e=0e+00
+4096       93.185ms e=0e+00   16.487ms e=0e+00    9.314ms e=0e+00    0.466ms e=0e+00
+8192      373.916ms e=0e+00  116.346ms e=0e+00   33.897ms e=0e+00    1.467ms e=0e+00
+
+Batch=4, Heads=8, HeadDim=64
+SeqLen                naive              tiled          tiled_f16             triton
+----------------------------------------------------------------------------------------------------
+256         6.016ms e=0e+00    0.238ms e=0e+00    0.140ms e=0e+00    0.058ms e=0e+00
+512        12.509ms e=0e+00    0.715ms e=0e+00    0.453ms e=0e+00    0.070ms e=0e+00
+1024       25.340ms e=0e+00    2.338ms e=0e+00    1.390ms e=0e+00    0.131ms e=0e+00
+2048       93.519ms e=0e+00    8.248ms e=0e+00    4.612ms e=0e+00    0.287ms e=0e+00
+4096      372.666ms e=0e+00   56.964ms e=0e+00   18.137ms e=0e+00    0.799ms e=0e+00

@@ -20,11 +20,11 @@ import warp as wp
 NEG_INF = wp.constant(-1.0e10)
 
 # Default tile sizes for tile_matmul-based flash attention
-TILE_M = 64
-TILE_N = 64
-TILE_THREADS = 256
+TILE_M = 16
+TILE_N = 16
+TILE_THREADS = 64
 # Supported head dimensions
-SUPPORTED_HEAD_DIMS = [32, 64, 128, 256]
+SUPPORTED_HEAD_DIMS = [64, 128, 256]
 
 
 # Helper functions for tile_map operations (FP32)
@@ -173,13 +173,13 @@ def create_flash_attention_tiled_kernel(head_dim: int, tile_m: int = 16, tile_n:
         Q_tile_3d = wp.tile_load(Q, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, q_start, 0))
         Q_tile = wp.tile_squeeze(Q_tile_3d, axis=(0,))
 
-        # Initialize output accumulator in registers (distributed across threads)
-        # Using registers instead of shared memory to reduce SRAM usage
-        O_acc = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=float)
+        # Initialize output accumulator in shared memory
+        O_acc = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=float, storage="shared")
 
-        # Initialize online softmax state per row in registers
-        m_i = wp.tile_full(shape=(TILE_M_LOCAL, 1), value=float(NEG_INF), dtype=float)
-        l_i = wp.tile_zeros(shape=(TILE_M_LOCAL, 1), dtype=float)
+        # Initialize online softmax state in shared memory (tiny - 128 bytes total)
+        # Must be shared because TILE_M (16) < TILE_THREADS (128)
+        m_i = wp.tile_full(shape=(TILE_M_LOCAL, 1), value=float(NEG_INF), dtype=float, storage="shared")
+        l_i = wp.tile_zeros(shape=(TILE_M_LOCAL, 1), dtype=float, storage="shared")
 
         # Iterate over K/V blocks (outer loop in FlashAttention paper)
         for k_block in range(num_k_blocks):
@@ -193,7 +193,7 @@ def create_flash_attention_tiled_kernel(head_dim: int, tile_m: int = 16, tile_n:
             V_tile_3d = wp.tile_load(V, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0), storage="shared")
             V_tile = wp.tile_squeeze(V_tile_3d, axis=(0,))
 
-            # Compute S = Q @ K^T on SRAM: (TILE_M, HEAD_DIM) @ (HEAD_DIM, TILE_N) = (TILE_M, TILE_N)
+            # Compute S = Q @ K^T: (TILE_M, HEAD_DIM) @ (HEAD_DIM, TILE_N) = (TILE_M, TILE_N)
             K_T = wp.tile_transpose(K_tile)
             S = wp.tile_zeros(shape=(TILE_M_LOCAL, TILE_N_LOCAL), dtype=float)
             wp.tile_matmul(Q_tile, K_T, S)
@@ -287,9 +287,9 @@ def create_flash_attention_tiled_f16_kernel(head_dim: int, tile_m: int = 16, til
         Q_tile_3d = wp.tile_load(Q, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, q_start, 0))
         Q_tile = wp.tile_squeeze(Q_tile_3d, axis=(0,))
 
-        O_acc = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=wp.float16, storage="shared")
-        m_i = wp.tile_full(shape=(TILE_M_LOCAL, 1), value=NEG_INF_F16, dtype=wp.float16, storage="shared")
-        l_i = wp.tile_zeros(shape=(TILE_M_LOCAL, 1), dtype=wp.float16, storage="shared")
+        O_acc = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=wp.float16)
+        m_i = wp.tile_full(shape=(TILE_M_LOCAL, 1), value=NEG_INF_F16, dtype=wp.float16)
+        l_i = wp.tile_zeros(shape=(TILE_M_LOCAL, 1), dtype=wp.float16)
 
         for k_block in range(num_k_blocks):
             k_start = k_block * TILE_N_LOCAL
@@ -358,7 +358,6 @@ if __name__ == "__main__":
 
     # Test configurations: (batch, heads, seq_len, head_dim)
     test_configs = [
-        (2, 4, 128, 32),
         (2, 4, 128, 64),
         (2, 4, 128, 128),
     ]
@@ -401,31 +400,21 @@ if __name__ == "__main__":
         tile_m, tile_n = TILE_M, TILE_N
         tiled_kernel = get_tiled_kernel(head_dim, tile_m, tile_n)
         print(f"    Using TILE_M={tile_m}, TILE_N={tile_n}")
-        padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
-        num_q_blocks = padded_seq // tile_m
-        num_k_blocks = padded_seq // tile_n
+        num_q_blocks = seq_len // tile_m
+        num_k_blocks = seq_len // tile_n
         num_tiles_tiled = batch_heads * num_q_blocks
 
-        Q_padded_np = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        K_padded_np = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        V_padded_np = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        Q_padded_np[:, :seq_len, :] = Q_np
-        K_padded_np[:, :seq_len, :] = K_np
-        V_padded_np[:, :seq_len, :] = V_np
-
-        Q_tiled = wp.array(Q_padded_np, dtype=float)
-        K_tiled = wp.array(K_padded_np, dtype=float)
-        V_tiled = wp.array(V_padded_np, dtype=float)
+        Q_tiled = wp.array(Q_np, dtype=float)
+        K_tiled = wp.array(K_np, dtype=float)
+        V_tiled = wp.array(V_np, dtype=float)
         O_tiled = wp.zeros_like(Q_tiled)
-
         wp.launch_tiled(
             tiled_kernel,
             dim=num_tiles_tiled,
-            inputs=[Q_tiled, K_tiled, V_tiled, O_tiled, sm_scale, padded_seq, batch_heads, num_q_blocks, num_k_blocks],
+            inputs=[Q_tiled, K_tiled, V_tiled, O_tiled, sm_scale, seq_len, batch_heads, num_q_blocks, num_k_blocks],
             block_dim=TILE_THREADS,
         )
-        O_result = O_tiled.numpy()[:, :seq_len, :]
-        err = np.max(np.abs(O_result - ref_out))
+        err = np.max(np.abs(O_tiled.numpy() - ref_out))
         status = "PASS" if err < 1e-5 else "FAIL"
         print(f"  Tiled:      err={err:.2e} [{status}]")
         if status == "FAIL":
