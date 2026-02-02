@@ -1315,16 +1315,6 @@ inline CUDA_CALLABLE int block_dim()
 #endif
 }
 
-// Returns the thread index within the current block (0 to block_dim-1)
-inline CUDA_CALLABLE int block_thread_idx()
-{
-#if defined(__CUDA_ARCH__)
-    return threadIdx.x;
-#else
-    return 0;
-#endif
-}
-
 inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t& bounds)
 {
     // For the 1-D tid() we need to warn the user if we're about to provide a truncated index
