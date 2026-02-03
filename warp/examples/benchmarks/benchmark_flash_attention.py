@@ -16,6 +16,7 @@ To include official flash_attn comparison:
     pip install flash-attn --no-build-isolation
 """
 
+import argparse
 import sys
 import time
 from statistics import mean
@@ -50,26 +51,107 @@ from tile.example_tile_flash_attention import (
     get_naive_kernel,
     get_tiled_kernel,
     get_tiled_kernel_f16,
+    create_flash_attention_kernel,
     TILE_M,
     TILE_N,
     TILE_THREADS,
 )
 
-IMPLEMENTATIONS = ["naive", "tiled", "tiled_f16"]
+# Cache for flash kernels (hybrid per-thread/tile approach)
+_flash_kernel_cache = {}
+
+# Target dims per thread — lower means less register pressure & shorter dep chains
+D_SLICE = 8
+MAX_BLOCK_DIM = 1024  # CUDA max threads per block
+MAX_SMEM_BYTES = 99 * 1024  # Conservative shared memory budget (99 KB)
+
+
+def estimate_smem(tile_m: int, tile_n: int, head_dim: int, elem_size: int) -> int:
+    """Estimate shared memory usage for flash attention kernel.
+
+    Shared tiles: Q_3d (promoted by squeeze), K_3d (promoted by squeeze),
+    V_3d (promoted by squeeze), S_tile (promoted by tile_matmul),
+    plus an extra Q-sized allocation from matmul workspace.
+    """
+    return tile_m * (2 * head_dim + tile_n) * elem_size + 2 * tile_n * head_dim * elem_size
+
+
+def compute_flash_config(head_dim: int, d_slice: int = D_SLICE, use_fp16: bool = False):
+    """Compute optimal (tile_m, tile_n, threads_per_row) for a given head_dim.
+
+    Strategy: each thread owns d_slice dims of head_dim.
+    Maximize tile_m (BLOCK_M) while keeping:
+      - block_dim = tile_m * threads_per_row <= MAX_BLOCK_DIM
+      - shared memory <= MAX_SMEM_BYTES
+    """
+    elem_size = 2 if use_fp16 else 4
+    threads_per_row = head_dim // d_slice
+
+    # Start with max tile_m from thread budget, then reduce for shared memory
+    tile_m = min(128, MAX_BLOCK_DIM // threads_per_row)
+    tile_n = 64
+
+    # Reduce tile_m to fit shared memory, halving each time
+    while tile_m > 16 and estimate_smem(tile_m, tile_n, head_dim, elem_size) > MAX_SMEM_BYTES:
+        tile_m //= 2
+
+    # If still too large, also reduce tile_n
+    if estimate_smem(tile_m, tile_n, head_dim, elem_size) > MAX_SMEM_BYTES:
+        tile_n = 32
+        while tile_m > 16 and estimate_smem(tile_m, tile_n, head_dim, elem_size) > MAX_SMEM_BYTES:
+            tile_m //= 2
+
+    return tile_m, tile_n, threads_per_row
+
+
+def get_flash_kernel(head_dim: int, tile_m: int = None, tile_n: int = None,
+                     use_fp16: bool = False, threads_per_row: int = None):
+    """Get or create flash attention kernel (hybrid approach).
+
+    If tile_m/tile_n/threads_per_row not specified, computes optimal config from head_dim.
+    """
+    if tile_m is None or tile_n is None or threads_per_row is None:
+        tile_m, tile_n, threads_per_row = compute_flash_config(head_dim, use_fp16=use_fp16)
+    key = (head_dim, tile_m, tile_n, use_fp16, threads_per_row)
+    if key not in _flash_kernel_cache:
+        _flash_kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n, use_fp16, threads_per_row)
+    return _flash_kernel_cache[key]
+
+ALL_IMPLEMENTATIONS = ["naive", "flash", "flash_f16", "tiled", "tiled_f16"]
 if HAS_TRITON:
-    IMPLEMENTATIONS.append("triton")
+    ALL_IMPLEMENTATIONS.append("triton")
 if HAS_FLASH_ATTN:
-    IMPLEMENTATIONS.append("flash_attn")
+    ALL_IMPLEMENTATIONS.append("flash_attn")
+
+# Will be set based on --skip-naive flag
+IMPLEMENTATIONS = ALL_IMPLEMENTATIONS.copy()
 
 
-def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array, sm_scale: float, head_dim: int):
+def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array, sm_scale: float, head_dim: int,
+                  tile_m: int = None, tile_n: int = None):
     batch_heads, seq_len, _ = Q.shape
     if impl == "naive":
         kernel = get_naive_kernel(head_dim)
         wp.launch(kernel, dim=(seq_len, batch_heads), inputs=[Q, K, V, O, sm_scale, seq_len])
+    elif impl == "flash":
+        # Hybrid approach: tile_matmul + per-thread accumulators, threads_per_row split head_dim
+        cfg_tile_m, cfg_tile_n, cfg_tpr = compute_flash_config(head_dim)
+        tile_m = tile_m or cfg_tile_m
+        tile_n = tile_n or cfg_tile_n
+        kernel = get_flash_kernel(head_dim, tile_m, tile_n, threads_per_row=cfg_tpr)
+        num_q_blocks = (seq_len + tile_m - 1) // tile_m
+        num_k_blocks = (seq_len + tile_n - 1) // tile_n
+        block_dim = tile_m * cfg_tpr
+        total_threads = batch_heads * num_q_blocks * block_dim
+        wp.launch(
+            kernel,
+            dim=total_threads,
+            inputs=[Q, K, V, O, sm_scale, seq_len, batch_heads, num_q_blocks, num_k_blocks],
+            block_dim=block_dim,
+        )
     elif impl == "tiled":
         tile_m, tile_n = TILE_M, TILE_N
-        kernel = get_tiled_kernel(head_dim, tile_m, tile_n)  # Pass tile sizes to kernel factory
+        kernel = get_tiled_kernel(head_dim, tile_m, tile_n)
         padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
         num_q_blocks = padded_seq // tile_m
         num_k_blocks = padded_seq // tile_n
@@ -144,6 +226,84 @@ def benchmark(batch: int, heads: int, seq_len: int, impl: str, head_dim: int = 6
             timings.append((time.perf_counter() - start) * 1000)
 
         O_out = O_torch.float().cpu().numpy().reshape(shape)
+        error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
+        return mean(timings), error, O_out
+
+    # Handle flash kernel (hybrid approach - needs padded arrays)
+    if impl == "flash":
+        tile_m, tile_n, tpr = compute_flash_config(head_dim)
+        padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
+        Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
+        K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
+        V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
+        Q_padded[:, :seq_len, :] = Q_np
+        K_padded[:, :seq_len, :] = K_np
+        V_padded[:, :seq_len, :] = V_np
+
+        Q = wp.array(Q_padded, dtype=float)
+        K = wp.array(K_padded, dtype=float)
+        V = wp.array(V_padded, dtype=float)
+        O = wp.zeros_like(Q)
+
+        for _ in range(warmup):
+            launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
+        wp.synchronize()
+
+        timings = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
+            wp.synchronize()
+            timings.append((time.perf_counter() - start) * 1000)
+
+        O_out = O.numpy()[:, :seq_len, :]
+        error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
+        return mean(timings), error, O_out
+
+    # Handle flash_f16 kernel (FP16 version of flash)
+    if impl == "flash_f16":
+        tile_m, tile_n, tpr = compute_flash_config(head_dim, use_fp16=True)
+        padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
+        Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
+        K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
+        V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
+        Q_padded[:, :seq_len, :] = Q_np.astype(np.float16)
+        K_padded[:, :seq_len, :] = K_np.astype(np.float16)
+        V_padded[:, :seq_len, :] = V_np.astype(np.float16)
+
+        Q = wp.array(Q_padded, dtype=wp.float16)
+        K = wp.array(K_padded, dtype=wp.float16)
+        V = wp.array(V_padded, dtype=wp.float16)
+        O = wp.zeros_like(Q)
+
+        kernel = get_flash_kernel(head_dim, tile_m, tile_n, use_fp16=True, threads_per_row=tpr)
+        num_q_blocks = padded_seq // tile_m
+        num_k_blocks = padded_seq // tile_n
+        block_dim = tile_m * tpr
+        total_threads = batch_heads * num_q_blocks * block_dim
+
+        for _ in range(warmup):
+            wp.launch(
+                kernel,
+                dim=total_threads,
+                inputs=[Q, K, V, O, sm_scale, padded_seq, batch_heads, num_q_blocks, num_k_blocks],
+                block_dim=block_dim,
+            )
+        wp.synchronize()
+
+        timings = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            wp.launch(
+                kernel,
+                dim=total_threads,
+                inputs=[Q, K, V, O, sm_scale, padded_seq, batch_heads, num_q_blocks, num_k_blocks],
+                block_dim=block_dim,
+            )
+            wp.synchronize()
+            timings.append((time.perf_counter() - start) * 1000)
+
+        O_out = O.numpy()[:, :seq_len, :].astype(np.float32)
         error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
         return mean(timings), error, O_out
 
@@ -314,11 +474,31 @@ def run_scaling_benchmarks():
 
 
 def main():
+    global IMPLEMENTATIONS
+
+    parser = argparse.ArgumentParser(description="Flash Attention Benchmark")
+    parser.add_argument("--skip-naive", action="store_true", help="Skip naive implementation (slowest)")
+    args = parser.parse_args()
+
+    if args.skip_naive:
+        IMPLEMENTATIONS = [impl for impl in ALL_IMPLEMENTATIONS if impl != "naive"]
+    else:
+        IMPLEMENTATIONS = ALL_IMPLEMENTATIONS.copy()
+
     wp.init()
 
     print("Flash Attention Benchmark")
     print(f"Device: {wp.get_device()}")
     print(f"Implementations: {IMPLEMENTATIONS}")
+    print(f"D_SLICE={D_SLICE} (target dims per thread), MAX_SMEM={MAX_SMEM_BYTES//1024}KB")
+    for hd in [64, 128]:
+        for fp16 in [False, True]:
+            label = "fp16" if fp16 else "fp32"
+            tm, tn, tpr = compute_flash_config(hd, use_fp16=fp16)
+            elem = 2 if fp16 else 4
+            smem = estimate_smem(tm, tn, hd, elem)
+            print(f"  head_dim={hd} {label}: tile_m={tm}, tile_n={tn}, tpr={tpr}, "
+                  f"block_dim={tm*tpr} ({tm*tpr//32}w), D={hd//tpr}, smem={smem//1024}KB")
 
     run_scaling_benchmarks()
 

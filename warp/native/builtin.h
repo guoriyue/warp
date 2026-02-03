@@ -649,6 +649,40 @@ inline CUDA_CALLABLE double exp(double a)
     return result;
 }
 
+inline CUDA_CALLABLE half exp2(half a)
+{
+    half result = ::exp2f(float(a));
+#if FP_CHECK
+    if (!isfinite(a) || !isfinite(result)) {
+        printf("%s:%d exp2(%f) = %f\n", __FILE__, __LINE__, float(a), float(result));
+        assert(0);
+    }
+#endif
+    return result;
+}
+inline CUDA_CALLABLE float exp2(float a)
+{
+    float result = ::exp2f(a);
+#if FP_CHECK
+    if (!isfinite(a) || !isfinite(result)) {
+        printf("%s:%d exp2(%f) = %f\n", __FILE__, __LINE__, a, result);
+        assert(0);
+    }
+#endif
+    return result;
+}
+inline CUDA_CALLABLE double exp2(double a)
+{
+    double result = ::exp2(a);
+#if FP_CHECK
+    if (!isfinite(a) || !isfinite(result)) {
+        printf("%s:%d exp2(%f) = %f\n", __FILE__, __LINE__, a, result);
+        assert(0);
+    }
+#endif
+    return result;
+}
+
 inline CUDA_CALLABLE half pow(half a, half b)
 {
     float result = ::powf(float(a), float(b));
@@ -1027,6 +1061,7 @@ inline CUDA_CALLABLE void adj_log10(T a, T& adj_a, T adj_ret)\
     })\
 }\
 inline CUDA_CALLABLE void adj_exp(T a, T ret, T& adj_a, T adj_ret) { adj_a += ret*adj_ret; }\
+inline CUDA_CALLABLE void adj_exp2(T a, T ret, T& adj_a, T adj_ret) { adj_a += T(0.6931471805599453) * ret * adj_ret; }\
 inline CUDA_CALLABLE void adj_pow(T a, T b, T ret, T& adj_a, T& adj_b, T adj_ret)\
 { \
     adj_a += b*pow(a, b-T(1))*adj_ret;\
