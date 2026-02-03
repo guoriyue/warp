@@ -49,12 +49,7 @@ except Exception as e:
 sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
 from tile.example_tile_flash_attention import (
     get_naive_kernel,
-    get_tiled_kernel,
-    get_tiled_kernel_f16,
     create_flash_attention_kernel,
-    TILE_M,
-    TILE_N,
-    TILE_THREADS,
 )
 
 # Cache for flash kernels (hybrid per-thread/tile approach)
@@ -117,7 +112,7 @@ def get_flash_kernel(head_dim: int, tile_m: int = None, tile_n: int = None,
         _flash_kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n, use_fp16, threads_per_row)
     return _flash_kernel_cache[key]
 
-ALL_IMPLEMENTATIONS = ["naive", "flash", "flash_f16", "tiled", "tiled_f16"]
+ALL_IMPLEMENTATIONS = ["naive", "flash", "flash_f16"]
 if HAS_TRITON:
     ALL_IMPLEMENTATIONS.append("triton")
 if HAS_FLASH_ATTN:
@@ -148,19 +143,6 @@ def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array,
             dim=total_threads,
             inputs=[Q, K, V, O, sm_scale, seq_len, batch_heads, num_q_blocks, num_k_blocks],
             block_dim=block_dim,
-        )
-    elif impl == "tiled":
-        tile_m, tile_n = TILE_M, TILE_N
-        kernel = get_tiled_kernel(head_dim, tile_m, tile_n)
-        padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
-        num_q_blocks = padded_seq // tile_m
-        num_k_blocks = padded_seq // tile_n
-        num_tiles = batch_heads * num_q_blocks
-        wp.launch_tiled(
-            kernel,
-            dim=num_tiles,
-            inputs=[Q, K, V, O, sm_scale, seq_len, batch_heads, num_q_blocks, num_k_blocks],
-            block_dim=TILE_THREADS,
         )
 
 
@@ -299,84 +281,6 @@ def benchmark(batch: int, heads: int, seq_len: int, impl: str, head_dim: int = 6
                 dim=total_threads,
                 inputs=[Q, K, V, O, sm_scale, padded_seq, batch_heads, num_q_blocks, num_k_blocks],
                 block_dim=block_dim,
-            )
-            wp.synchronize()
-            timings.append((time.perf_counter() - start) * 1000)
-
-        O_out = O.numpy()[:, :seq_len, :].astype(np.float32)
-        error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
-        return mean(timings), error, O_out
-
-    # Handle tiled kernel (needs padded arrays)
-    if impl == "tiled":
-        tile_m = TILE_M
-        padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
-        Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-        Q_padded[:, :seq_len, :] = Q_np
-        K_padded[:, :seq_len, :] = K_np
-        V_padded[:, :seq_len, :] = V_np
-
-        Q = wp.array(Q_padded, dtype=float)
-        K = wp.array(K_padded, dtype=float)
-        V = wp.array(V_padded, dtype=float)
-        O = wp.zeros_like(Q)
-
-        for _ in range(warmup):
-            launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
-        wp.synchronize()
-
-        timings = []
-        for _ in range(iterations):
-            start = time.perf_counter()
-            launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
-            wp.synchronize()
-            timings.append((time.perf_counter() - start) * 1000)
-
-        O_out = O.numpy()[:, :seq_len, :]
-        error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
-        return mean(timings), error, O_out
-
-    # Handle tiled_f16 kernel (same tile sizes as FP32)
-    if impl == "tiled_f16":
-        tile_m = TILE_M
-        padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
-        Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        Q_padded[:, :seq_len, :] = Q_np.astype(np.float16)
-        K_padded[:, :seq_len, :] = K_np.astype(np.float16)
-        V_padded[:, :seq_len, :] = V_np.astype(np.float16)
-
-        Q = wp.array(Q_padded, dtype=wp.float16)
-        K = wp.array(K_padded, dtype=wp.float16)
-        V = wp.array(V_padded, dtype=wp.float16)
-        O = wp.zeros_like(Q)
-
-        kernel = get_tiled_kernel_f16(head_dim, TILE_M, TILE_N)
-        num_q_blocks = padded_seq // TILE_M
-        num_k_blocks = padded_seq // TILE_N
-        num_tiles = batch_heads * num_q_blocks
-        sm_scale_f16 = wp.float16(sm_scale)
-
-        for _ in range(warmup):
-            wp.launch_tiled(
-                kernel,
-                dim=num_tiles,
-                inputs=[Q, K, V, O, sm_scale_f16, padded_seq, batch_heads, num_q_blocks, num_k_blocks],
-                block_dim=TILE_THREADS,
-            )
-        wp.synchronize()
-
-        timings = []
-        for _ in range(iterations):
-            start = time.perf_counter()
-            wp.launch_tiled(
-                kernel,
-                dim=num_tiles,
-                inputs=[Q, K, V, O, sm_scale_f16, padded_seq, batch_heads, num_q_blocks, num_k_blocks],
-                block_dim=TILE_THREADS,
             )
             wp.synchronize()
             timings.append((time.perf_counter() - start) * 1000)
