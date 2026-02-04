@@ -1922,6 +1922,10 @@ def exp(x: Float) -> Float:
     """Return the value of the exponential function :math:`e^x`."""
     ...
 
+def exp2(x: Float) -> Float:
+    """Return the value of the base-2 exponential function :math:`2^x`."""
+    ...
+
 def pow(x: Float, y: Float) -> Float:
     """Return the result of ``x`` raised to power of ``y``."""
     ...
@@ -3780,7 +3784,7 @@ def tile_map(op: Callable, a: Tile[Any, tuple[int, ...]], b: Tile[Any, tuple[int
     ...
 
 @over
-def tile_map(op: Callable, *args: Tile[Scalar, tuple[int, ...]]) -> Tile[Scalar, tuple[int, ...]]:
+(op: Callable, *args: Tile[Scalar, tuple[int, ...]]) -> Tile[Scalar, tuple[int, ...]]:
     """Apply a user-defined function to multiple tiles element-wise.
 
     This function cooperatively applies a user-defined function to corresponding elements of three or more tiles using all threads in the block.

@@ -281,6 +281,14 @@ add_builtin(
     require_original_output_arg=True,
 )
 add_builtin(
+    "exp2",
+    input_types={"x": Float},
+    value_func=sametypes_create_value_func(Float),
+    doc="Return the value of the base-2 exponential function :math:`2^x`.",
+    group="Scalar Math",
+    require_original_output_arg=True,
+)
+add_builtin(
     "pow",
     input_types={"x": Float, "y": Float},
     value_func=sametypes_create_value_func(Float),
@@ -3848,6 +3856,58 @@ add_builtin(
     group="Tile Primitives",
     export=False,
 )
+
+
+def tile_assign_register_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return None
+
+    # Force destination to shared memory
+    # Note: We don't validate source storage here because the storage mutation bug
+    # may have incorrectly changed source tiles to "shared". The C++ templates
+    # (tile_shared_t, tile_register_t) will enforce correct types at compile time.
+    arg_types["dst"].storage = "shared"
+    return None
+
+
+def tile_assign_register_dispatch_func(input_types: Mapping[str, type], return_type: Any, args: Mapping[str, Var]):
+    dst = args["dst"]
+    src = args["src"]
+
+    if "offset" in args:
+        offset = extract_tuple(args["offset"])
+    else:
+        offset = (0,) * len(dst.type.shape)
+
+    func_args = (dst, src, *offset)
+    template_args = []
+
+    return (func_args, template_args)
+
+
+add_builtin(
+    "tile_assign_register",
+    input_types={
+        "dst": tile(dtype=Any, shape=tuple[int, ...]),
+        "src": tile(dtype=Any, shape=tuple[int, ...]),
+        "offset": tuple[int, ...],
+    },
+    value_func=tile_assign_register_value_func,
+    dispatch_func=tile_assign_register_dispatch_func,
+    defaults={"offset": None},
+    doc="""Assign a register tile to a shared memory tile.
+
+    This is an explicit function for register to shared tile assignment.
+    Use this when copying computed results (in registers) back to
+    shared memory accumulators in loops.
+
+    :param dst: Destination tile (will be in shared memory)
+    :param src: Source tile (must be in register storage)
+    :param offset: Optional offset into destination tile""",
+    group="Tile Primitives",
+    export=False,
+)
+
 
 # handles expressions like tile[i,j] = 1.0
 add_builtin(
@@ -7733,6 +7793,7 @@ add_builtin(
     native_func="builtin_block_dim",
     is_differentiable=False,
 )
+
 
 
 def copy_value_func(arg_types: Mapping[str, type], arg_values: Mapping[str, Any]):
