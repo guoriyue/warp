@@ -71,67 +71,26 @@ def estimate_smem(tile_m: int, tile_n: int, head_dim: int, elem_size: int) -> in
     return tile_m * (2 * head_dim + tile_n) * elem_size + 2 * tile_n * head_dim * elem_size
 
 
-def compute_flash_config(head_dim: int, d_slice: int = 16, use_fp16: bool = False):
-    """Compute optimal (tile_m, tile_n, threads_per_row) for a given head_dim.
+def compute_flash_config(head_dim: int):
+    """Compute (tile_m, tile_n) for a given head_dim.
 
-    Strategy: search over tpr candidates (prefer tpr=2,4 for less scalar softmax
-    redundancy and smaller blocks) and tile sizes, scoring by:
-      - block_dim close to 256 (good occupancy: 2-4 blocks/SM)
-      - d_per_thread close to 16 (good compute/memory ratio)
-      - larger tile_n preferred (fewer K/V tile loads)
-      - larger tile_m preferred (more Q rows per block)
+    With tile-op kernel, block_dim = tile_m. Hardcoded to tile_m=32, tile_n=32 for now.
     """
-    elem_size = 2 if use_fp16 else 4
+    return 32, 32
 
-    # tpr candidates: prefer 2 and 4 to avoid excessive scalar softmax redundancy
-    tpr_cands = [t for t in (2, 4) if head_dim % t == 0]
+def get_flash_kernel(head_dim: int, tile_m: int = None, tile_n: int = None):
+    """Get or create flash attention kernel (fp16).
 
-    best = None
-    best_score = -1e30
-
-    for tpr in tpr_cands:
-        for tile_m in (32, 64, 128):
-            block_dim = tile_m * tpr
-            if block_dim > MAX_BLOCK_DIM:
-                continue
-
-            for tile_n in (64, 32):
-                smem = estimate_smem(tile_m, tile_n, head_dim, elem_size)
-                if smem > MAX_SMEM_BYTES:
-                    continue
-
-                dpt = head_dim // tpr
-                score = 0.0
-                score -= abs(block_dim - 256) * 0.02  # prefer block_dim near 256
-                score -= abs(dpt - 16) * 0.05  # prefer d_per_thread near 16
-                if tile_n == 64:
-                    score += 1.0  # prefer larger tile_n
-                score += (tile_m / 64.0) * 0.3  # prefer larger tile_m
-
-                if score > best_score:
-                    best_score = score
-                    best = (tile_m, tile_n, tpr)
-
-    if best is None:
-        return 64, 64, 4  # safe fallback
-
-    return best
-
-
-def get_flash_kernel(head_dim: int, tile_m: int = None, tile_n: int = None,
-                     use_fp16: bool = False, threads_per_row: int = None):
-    """Get or create flash attention kernel (hybrid approach).
-
-    If tile_m/tile_n/threads_per_row not specified, computes optimal config from head_dim.
+    If tile_m/tile_n not specified, computes optimal config from head_dim.
     """
-    if tile_m is None or tile_n is None or threads_per_row is None:
-        tile_m, tile_n, threads_per_row = compute_flash_config(head_dim, use_fp16=use_fp16)
-    key = (head_dim, tile_m, tile_n, use_fp16, threads_per_row)
+    if tile_m is None or tile_n is None:
+        tile_m, tile_n = compute_flash_config(head_dim)
+    key = (head_dim, tile_m, tile_n)
     if key not in _flash_kernel_cache:
-        _flash_kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n, use_fp16, threads_per_row)
+        _flash_kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n)
     return _flash_kernel_cache[key]
 
-ALL_IMPLEMENTATIONS = ["naive", "wp_flash_attn", "wp_flash_attn_f16"]
+ALL_IMPLEMENTATIONS = ["naive", "wp_flash_attn"]
 if HAS_TRITON:
     ALL_IMPLEMENTATIONS.append("triton")
 if HAS_FLASH_ATTN:
@@ -147,18 +106,15 @@ def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array,
     if impl == "naive":
         kernel = get_naive_kernel(head_dim)
         wp.launch(kernel, dim=(seq_len, batch_heads), inputs=[Q, K, V, O, sm_scale, seq_len])
-    elif impl in ("wp_flash_attn", "wp_flash_attn_f16"):
-        use_fp16 = impl == "wp_flash_attn_f16"
-        # Hybrid approach: tile_matmul + per-thread accumulators, threads_per_row split head_dim
-        cfg_tile_m, cfg_tile_n, cfg_tpr = compute_flash_config(head_dim, use_fp16=use_fp16)
+    elif impl == "wp_flash_attn":
+        cfg_tile_m, cfg_tile_n = compute_flash_config(head_dim)
         tile_m = tile_m or cfg_tile_m
         tile_n = tile_n or cfg_tile_n
-        kernel = get_flash_kernel(head_dim, tile_m, tile_n, use_fp16=use_fp16, threads_per_row=cfg_tpr)
+        kernel = get_flash_kernel(head_dim, tile_m, tile_n)
         num_q_blocks = (seq_len + tile_m - 1) // tile_m
         num_k_blocks = (seq_len + tile_n - 1) // tile_n
-        block_dim = tile_m * cfg_tpr
+        block_dim = tile_m
         total_threads = batch_heads * num_q_blocks * block_dim
-        print(f"[{impl}] head_dim={head_dim}, tile_m={tile_m}, tile_n={tile_n}, tpr={cfg_tpr}, block_dim={block_dim}")
         wp.launch(
             kernel,
             dim=total_threads,
@@ -232,32 +188,21 @@ def benchmark(batch: int, heads: int, seq_len: int, impl: str, head_dim: int = 6
         error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
         return mean(timings), error, O_out
 
-    # Handle wp_flash_attn / wp_flash_attn_f16 kernels (hybrid approach - needs padded arrays)
-    if impl in ("wp_flash_attn", "wp_flash_attn_f16"):
-        use_fp16 = impl == "wp_flash_attn_f16"
-        tile_m, tile_n, tpr = compute_flash_config(head_dim, use_fp16=use_fp16)
+    # Handle wp_flash_attn kernel (fp16 - needs padded arrays)
+    if impl == "wp_flash_attn":
+        tile_m, tile_n = compute_flash_config(head_dim)
         padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
 
-        if use_fp16:
-            np_dtype, wp_dtype = np.float16, wp.float16
-            Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np_dtype)
-            K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np_dtype)
-            V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np_dtype)
-            Q_padded[:, :seq_len, :] = Q_np.astype(np_dtype)
-            K_padded[:, :seq_len, :] = K_np.astype(np_dtype)
-            V_padded[:, :seq_len, :] = V_np.astype(np_dtype)
-        else:
-            wp_dtype = float
-            Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-            K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-            V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float32)
-            Q_padded[:, :seq_len, :] = Q_np
-            K_padded[:, :seq_len, :] = K_np
-            V_padded[:, :seq_len, :] = V_np
+        Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
+        K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
+        V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
+        Q_padded[:, :seq_len, :] = Q_np.astype(np.float16)
+        K_padded[:, :seq_len, :] = K_np.astype(np.float16)
+        V_padded[:, :seq_len, :] = V_np.astype(np.float16)
 
-        Q = wp.array(Q_padded, dtype=wp_dtype)
-        K = wp.array(K_padded, dtype=wp_dtype)
-        V = wp.array(V_padded, dtype=wp_dtype)
+        Q = wp.array(Q_padded, dtype=wp.float16)
+        K = wp.array(K_padded, dtype=wp.float16)
+        V = wp.array(V_padded, dtype=wp.float16)
         O = wp.zeros_like(Q)
 
         for _ in range(warmup):
@@ -271,9 +216,7 @@ def benchmark(batch: int, heads: int, seq_len: int, impl: str, head_dim: int = 6
             wp.synchronize()
             timings.append((time.perf_counter() - start) * 1000)
 
-        O_out = O.numpy()[:, :seq_len, :]
-        if use_fp16:
-            O_out = O_out.astype(np.float32)
+        O_out = O.numpy()[:, :seq_len, :].astype(np.float32)
         error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
         return mean(timings), error, O_out
 
@@ -303,8 +246,8 @@ def run_scaling_benchmarks():
     print("\n" + "=" * 100)
     print("SCALING BENCHMARKS (head_dim=64) - comparing against flash_attn reference")
     print("=" * 100)
-
-    seq_lengths = [256, 512, 1024, 2048, 4096, 8192]
+    # 256, 512, 1024, 2048, 4096,
+    seq_lengths = [8192]
     batch_heads_configs = [(1, 8)] #, (2, 8), (4, 8)]
     head_dim = 64
 
@@ -382,15 +325,13 @@ def main():
     print("Flash Attention Benchmark")
     print(f"Device: {wp.get_device()}")
     print(f"Implementations: {IMPLEMENTATIONS}")
-    print(f"MAX_WARPS_PER_BLOCK={MAX_WARPS_PER_BLOCK} (block_dim<={MAX_BLOCK_DIM}), MAX_SMEM={MAX_SMEM_BYTES//1024}KB")
+    print(f"MAX_BLOCK_DIM={MAX_BLOCK_DIM}, MAX_SMEM={MAX_SMEM_BYTES//1024}KB (tile-op kernel, fp16)")
     for hd in [64, 128]:
-        for fp16 in [False, True]:
-            label = "fp16" if fp16 else "fp32"
-            tm, tn, tpr = compute_flash_config(hd, use_fp16=fp16)
-            elem = 2 if fp16 else 4
-            smem = estimate_smem(tm, tn, hd, elem)
-            print(f"  head_dim={hd} {label}: tile_m={tm}, tile_n={tn}, tpr={tpr}, "
-                  f"block_dim={tm*tpr} ({tm*tpr//32}w), D={hd//tpr}, smem={smem//1024}KB")
+        tm, tn = compute_flash_config(hd)
+        smem = estimate_smem(tm, tn, hd, 2)  # fp16 = 2 bytes
+        block_dim = tm
+        print(f"  head_dim={hd}: tile_m={tm}, tile_n={tn}, "
+              f"block_dim={block_dim} ({block_dim//32}w), smem={smem//1024}KB")
 
     run_scaling_benchmarks()
 

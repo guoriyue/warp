@@ -63,16 +63,6 @@ template <typename T> inline CUDA_CALLABLE T warp_shuffle_down(T val, int offset
     return *reinterpret_cast<T*>(dest);
 }
 
-// // float16 (half) specialization - shuffle via bit reinterpretation
-// template <>
-// inline CUDA_CALLABLE half warp_shuffle_down<half>(half val, int offset, int mask)
-// {
-//     unsigned short bits = *reinterpret_cast<unsigned short*>(&val);
-//     unsigned int shuffled = __shfl_down_sync(static_cast<unsigned int>(mask), static_cast<unsigned int>(bits), offset, WP_TILE_WARP_SIZE);
-//     unsigned short result = static_cast<unsigned short>(shuffled);
-//     return *reinterpret_cast<half*>(&result);
-// }
-
 // vector overload
 template <unsigned Length, typename T>
 inline CUDA_CALLABLE wp::vec_t<Length, T> warp_shuffle_down(wp::vec_t<Length, T> val, int offset, int mask)

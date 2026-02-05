@@ -216,35 +216,6 @@ template <typename T> struct remove_reference<T&&> {
     using type = T;
 };
 
-// Forward declarations for tile type traits
-template <typename T, typename L> struct tile_register_t;
-template <typename T, typename L, bool Owner> struct tile_shared_t;
-
-// Type trait to detect register tiles
-template <typename T> struct is_tile_register {
-    static constexpr bool value = false;
-};
-
-template <typename T, typename L> struct is_tile_register<tile_register_t<T, L>> {
-    static constexpr bool value = true;
-};
-
-// Type trait to detect shared tiles
-template <typename T> struct is_tile_shared {
-    static constexpr bool value = false;
-};
-
-template <typename T, typename L, bool Owner> struct is_tile_shared<tile_shared_t<T, L, Owner>> {
-    static constexpr bool value = true;
-};
-
-// enable_if for SFINAE (NVRTC doesn't have enable_if)
-template <bool B, typename T = void> struct enable_if {};
-
-template <typename T> struct enable_if<true, T> {
-    using type = T;
-};
-
 template <int N> struct tile_coord_t {
     int indices[N];
 
@@ -5614,7 +5585,7 @@ adj_tile_assign(TileA& dest, TileB& src, Coord offset, AdjTileA& adj_dest, AdjTi
 // codegen entry points, which emit calls like `tile_assign(dest, src, i, j, k)`
 // a better approach here would be for codegen to just directly generate `tile_assign(dest, src, tile_coord(i, j, k))`
 // i.e.: call the above implementation methods directly, then we could remove these overloads
-// Note: For register→shared assignment, use tile_assign_register() which handles the template matching correctly.
+// Note: For register→shared assignment, use tile_assign_to_shared() which handles the template matching correctly.
 template <typename TileA, typename TileB> inline CUDA_CALLABLE void tile_assign(TileA& dest, TileB& src, int i)
 {
     tile_assign(dest, src, tile_coord(i));
@@ -5660,55 +5631,55 @@ inline CUDA_CALLABLE void adj_tile_assign(
 }
 
 
-// tile_assign_register: explicit register→shared tile assignment
+// tile_assign_to_shared: explicit register→shared tile assignment
 // These use generic template parameters because the storage mutation bug in Python
 // may have incorrectly labeled register tiles as shared tiles. We use static_cast
 // to force the const-qualification that enables the register→shared specialization.
 template <typename TileA, typename TileB>
-inline CUDA_CALLABLE void tile_assign_register(TileA& dest, TileB& src, int i)
+inline CUDA_CALLABLE void tile_assign_to_shared(TileA& dest, TileB& src, int i)
 {
     tile_assign(dest, static_cast<const TileB&>(src), tile_coord(i));
 }
 
 template <typename TileA, typename TileB>
-inline CUDA_CALLABLE void tile_assign_register(TileA& dest, TileB& src, int i, int j)
+inline CUDA_CALLABLE void tile_assign_to_shared(TileA& dest, TileB& src, int i, int j)
 {
     tile_assign(dest, static_cast<const TileB&>(src), tile_coord(i, j));
 }
 
 template <typename TileA, typename TileB>
-inline CUDA_CALLABLE void tile_assign_register(TileA& dest, TileB& src, int i, int j, int k)
+inline CUDA_CALLABLE void tile_assign_to_shared(TileA& dest, TileB& src, int i, int j, int k)
 {
     tile_assign(dest, static_cast<const TileB&>(src), tile_coord(i, j, k));
 }
 
 template <typename TileA, typename TileB>
-inline CUDA_CALLABLE void tile_assign_register(TileA& dest, TileB& src, int i, int j, int k, int l)
+inline CUDA_CALLABLE void tile_assign_to_shared(TileA& dest, TileB& src, int i, int j, int k, int l)
 {
     tile_assign(dest, static_cast<const TileB&>(src), tile_coord(i, j, k, l));
 }
 
-// adj_tile_assign_register: backward pass for register→shared assignment
+// adj_tile_assign_to_shared: backward pass for register→shared assignment
 template <typename TileA, typename TileB, typename AdjTileA, typename AdjTileB>
-inline CUDA_CALLABLE void adj_tile_assign_register(TileA& dest, TileB& src, int i, AdjTileA& adj_dest, AdjTileB& adj_src, int)
+inline CUDA_CALLABLE void adj_tile_assign_to_shared(TileA& dest, TileB& src, int i, AdjTileA& adj_dest, AdjTileB& adj_src, int)
 {
     adj_tile_assign(dest, src, tile_coord(i), adj_dest, adj_src, tile_coord(0));
 }
 
 template <typename TileA, typename TileB, typename AdjTileA, typename AdjTileB>
-inline CUDA_CALLABLE void adj_tile_assign_register(TileA& dest, TileB& src, int i, int j, AdjTileA& adj_dest, AdjTileB& adj_src, int, int)
+inline CUDA_CALLABLE void adj_tile_assign_to_shared(TileA& dest, TileB& src, int i, int j, AdjTileA& adj_dest, AdjTileB& adj_src, int, int)
 {
     adj_tile_assign(dest, src, tile_coord(i, j), adj_dest, adj_src, tile_coord(0));
 }
 
 template <typename TileA, typename TileB, typename AdjTileA, typename AdjTileB>
-inline CUDA_CALLABLE void adj_tile_assign_register(TileA& dest, TileB& src, int i, int j, int k, AdjTileA& adj_dest, AdjTileB& adj_src, int, int, int)
+inline CUDA_CALLABLE void adj_tile_assign_to_shared(TileA& dest, TileB& src, int i, int j, int k, AdjTileA& adj_dest, AdjTileB& adj_src, int, int, int)
 {
     adj_tile_assign(dest, src, tile_coord(i, j, k), adj_dest, adj_src, tile_coord(0));
 }
 
 template <typename TileA, typename TileB, typename AdjTileA, typename AdjTileB>
-inline CUDA_CALLABLE void adj_tile_assign_register(TileA& dest, TileB& src, int i, int j, int k, int l, AdjTileA& adj_dest, AdjTileB& adj_src, int, int, int, int)
+inline CUDA_CALLABLE void adj_tile_assign_to_shared(TileA& dest, TileB& src, int i, int j, int k, int l, AdjTileA& adj_dest, AdjTileB& adj_src, int, int, int, int)
 {
     adj_tile_assign(dest, src, tile_coord(i, j, k, l), adj_dest, adj_src, tile_coord(0));
 }

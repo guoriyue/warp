@@ -3858,7 +3858,7 @@ add_builtin(
 )
 
 
-def tile_assign_register_value_func(arg_types, arg_values):
+def tile_assign_to_shared_value_func(arg_types, arg_values):
     if arg_types is None:
         return None
 
@@ -3870,7 +3870,7 @@ def tile_assign_register_value_func(arg_types, arg_values):
     return None
 
 
-def tile_assign_register_dispatch_func(input_types: Mapping[str, type], return_type: Any, args: Mapping[str, Var]):
+def tile_assign_to_shared_dispatch_func(input_types: Mapping[str, type], return_type: Any, args: Mapping[str, Var]):
     dst = args["dst"]
     src = args["src"]
 
@@ -3886,23 +3886,22 @@ def tile_assign_register_dispatch_func(input_types: Mapping[str, type], return_t
 
 
 add_builtin(
-    "tile_assign_register",
+    "tile_assign_to_shared",
     input_types={
         "dst": tile(dtype=Any, shape=tuple[int, ...]),
         "src": tile(dtype=Any, shape=tuple[int, ...]),
         "offset": tuple[int, ...],
     },
-    value_func=tile_assign_register_value_func,
-    dispatch_func=tile_assign_register_dispatch_func,
+    value_func=tile_assign_to_shared_value_func,
+    dispatch_func=tile_assign_to_shared_dispatch_func,
     defaults={"offset": None},
-    doc="""Assign a register tile to a shared memory tile.
+    doc="""Assign a tile to shared memory.
 
-    This is an explicit function for register to shared tile assignment.
     Use this when copying computed results (in registers) back to
     shared memory accumulators in loops.
 
     :param dst: Destination tile (will be in shared memory)
-    :param src: Source tile (must be in register storage)
+    :param src: Source tile
     :param offset: Optional offset into destination tile""",
     group="Tile Primitives",
     export=False,

@@ -7,8 +7,7 @@ Flash Attention v2 implementation in Warp.
 
 Implementations:
 1. Naive 3-pass attention (baseline)
-2. Flash Attention FP32 - tile_matmul + per-thread streaming (tensor cores + SRAM)
-3. Flash Attention FP16 - tile_matmul + per-thread streaming (tensor cores + SRAM, half precision)
+2. Flash Attention FP16 - tile_matmul for QK^T and PV with per-thread scalar softmax
 
 Supports head dimensions: 32, 64, 128, 256
 Input shape: [batch_heads, seq_len, head_dim]
@@ -99,266 +98,139 @@ def get_naive_kernel(head_dim: int):
     return _kernel_cache[key]
 
 
-def create_flash_attention_kernel(head_dim: int, tile_m: int = 32, tile_n: int = 32,
-                                   use_fp16: bool = False, threads_per_row: int = 1):
-    """Flash attention with tile_matmul and per-thread streaming accumulation.
+def create_flash_attention_kernel(head_dim: int, tile_m: int = 32, tile_n: int = 32):
+    """Fully tile-based flash attention using tile_matmul, tile_reduce, tile_map, tile_broadcast.
 
-    Hybrid approach using tile operations where possible:
-    - Q loaded as tile once (reused across K/V blocks)
-    - tile_matmul for S = Q @ K^T (tensor core acceleration)
-    - Per-thread fused softmax + V accumulation (streaming)
-    - Multiple threads per row split head_dim for parallelism
+    Uses tensor cores (via tile_matmul) for the two matrix multiplies:
+    - S = Q @ K^T  [TILE_M, HEAD_DIM] @ [HEAD_DIM, TILE_N] -> [TILE_M, TILE_N]
+    - PV = P @ V   [TILE_M, TILE_N] @ [TILE_N, HEAD_DIM] -> [TILE_M, HEAD_DIM]
+
+    Uses FP16 for tensor core operations with FP32 accumulation for numerical precision.
 
     Args:
         head_dim: Head dimension (must be in SUPPORTED_HEAD_DIMS)
-        tile_m: Query block size
+        tile_m: Query block size (also determines block_dim)
         tile_n: Key/Value block size
-        use_fp16: Use FP16 precision (default False for FP32)
-        threads_per_row: Number of threads cooperating on each row (default 1).
-            Each thread handles head_dim // threads_per_row elements.
-            block_dim = tile_m * threads_per_row.
     """
-    assert head_dim % threads_per_row == 0, \
-        f"head_dim ({head_dim}) must be divisible by threads_per_row ({threads_per_row})"
 
-    d_per_thread = head_dim // threads_per_row
-    HEAD_DIM_CONST = wp.constant(head_dim)
-    D_PER_THREAD_CONST = wp.constant(d_per_thread)
-    TILE_N_CONST = wp.constant(tile_n)
+    @wp.kernel(enable_backward=False)
+    def flash_attention_kernel(
+        Q: wp.array3d(dtype=wp.float16),
+        K: wp.array3d(dtype=wp.float16),
+        V: wp.array3d(dtype=wp.float16),
+        O: wp.array3d(dtype=wp.float16),
+        sm_scale: float,
+        seq_len: int,
+        batch_heads: int,
+        num_q_blocks: int,
+        num_k_blocks: int,
+    ):
+        """Flash Attention FP16 - hybrid tile_matmul + per-thread softmax.
 
-    if use_fp16:
-        @wp.kernel(enable_backward=False)
-        def flash_attention_kernel_f16(
-            Q: wp.array3d(dtype=wp.float16),
-            K: wp.array3d(dtype=wp.float16),
-            V: wp.array3d(dtype=wp.float16),
-            O: wp.array3d(dtype=wp.float16),
-            sm_scale: float,
-            seq_len: int,
-            batch_heads: int,
-            num_q_blocks: int,
-            num_k_blocks: int,
-        ):
-            """Flash Attention FP16 I/O with FP32 accumulation.
+        tile_matmul for QK^T and PV (fp16 tensor cores).
+        Per-thread scalar softmax in fp32 for numerical precision.
+        """
+        TILE_M = wp.static(tile_m)
+        TILE_N = wp.static(tile_n)
+        HEAD_DIM = wp.static(head_dim)
 
-            Inputs/outputs are fp16, but all internal accumulation
-            (m_i, l_i, o_acc, p, alpha) runs in fp32 to avoid precision loss.
-            tile_matmul runs in fp16 on tensor cores for S = Q @ K^T.
-            Multiple threads per row split head_dim for parallelism.
-            Uses exp2 instead of exp for faster math (sm_scale pre-multiplied by LOG2E).
-            """
-            TILE_M_LOCAL = wp.static(tile_m)
-            TILE_N_LOCAL = wp.static(tile_n)
-            HEAD_DIM_LOCAL = wp.static(head_dim)
-            THREADS_PER_ROW = wp.static(threads_per_row)
-            D_PER_THREAD = wp.static(d_per_thread)
+        tile_idx = wp.tid() // TILE_M
+        batch_head = tile_idx // num_q_blocks
+        q_block_idx = tile_idx % num_q_blocks
+        q_start = q_block_idx * TILE_M
+        row = wp.tid() % TILE_M
 
-            # Thread indexing: threads_per_row threads cooperate on each Q row
-            threads_per_tile = TILE_M_LOCAL * THREADS_PER_ROW
-            tile_idx = wp.tid() // threads_per_tile
-            local_tid = wp.tid() % threads_per_tile
-            row_in_tile = local_tid // THREADS_PER_ROW
-            d_idx = local_tid % THREADS_PER_ROW
-            d_start = d_idx * D_PER_THREAD
+        if batch_head >= batch_heads:
+            return
 
-            batch_head = tile_idx // num_q_blocks
-            q_block_idx = tile_idx % num_q_blocks
-            q_start = q_block_idx * TILE_M_LOCAL
-            q_row = q_start + row_in_tile
+        sm_scale_log2 = sm_scale * 1.44269504
 
-            if batch_head >= batch_heads:
-                return
-            if q_row >= seq_len:
-                return
+        # Load Q tile [TILE_M, HEAD_DIM] fp16 shared
+        Q_tile = wp.tile_squeeze(
+            wp.tile_load(Q, shape=(1, TILE_M, HEAD_DIM), offset=(batch_head, q_start, 0)),
+            axis=(0,)
+        )
 
-            # Pre-multiply sm_scale by LOG2E so all exp() become exp2()
-            sm_scale_log2 = sm_scale * 1.44269504
+        # Per-thread scalar accumulators (fp32 for precision)
+        m_i = float(NEG_INF)
+        l_i = float(0.0)
+        o_acc = wp.vector(dtype=float, length=HEAD_DIM)
+        for d in range(HEAD_DIM):
+            o_acc[d] = float(0.0)
 
-            # Load Q block as tile (reused across all K/V blocks) - fp16 for tensor core matmul
-            Q_tile_3d = wp.tile_load(Q, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, q_start, 0))
-            Q_tile = wp.tile_squeeze(Q_tile_3d, axis=(0,))  # [TILE_M, HEAD_DIM]
+        for k_block in range(num_k_blocks):
+            k_start = k_block * TILE_N
 
-            # Per-thread accumulators in FP32 (only D_PER_THREAD elements)
-            m_i = float(-1e10)    # Running max (redundant across threads in same row)
-            l_i = float(0.0)     # Running sum of exp (redundant across threads in same row)
-            o_acc = wp.vector(dtype=float, length=D_PER_THREAD_CONST)
-            for d in range(D_PER_THREAD):
-                o_acc[d] = 0.0
+            # Load K tile [TILE_N, HEAD_DIM] fp16 shared
+            K_tile = wp.tile_squeeze(
+                wp.tile_load(K, shape=(1, TILE_N, HEAD_DIM), offset=(batch_head, k_start, 0)),
+                axis=(0,)
+            )
 
-            # Iterate over K/V blocks
-            for k_block in range(num_k_blocks):
-                k_start = k_block * TILE_N_LOCAL
+            # S = Q @ K^T [TILE_M, TILE_N] fp16 tensor cores
+            K_T = wp.tile_transpose(K_tile)
+            S_tile = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float16, storage="shared")
+            wp.tile_matmul(Q_tile, K_T, S_tile)
 
-                # Load K/V blocks - fp16 for tensor core matmul
-                K_tile_3d = wp.tile_load(K, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0))
-                K_tile = wp.tile_squeeze(K_tile_3d, axis=(0,))  # [TILE_N, HEAD_DIM]
-                V_tile_3d = wp.tile_load(V, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0))
-                V_tile = wp.tile_squeeze(V_tile_3d, axis=(0,))  # [TILE_N, HEAD_DIM]
+            # Load V tile early so global memory fetch overlaps with softmax compute
+            V_tile = wp.tile_squeeze(
+                wp.tile_load(V, shape=(1, TILE_N, HEAD_DIM), offset=(batch_head, k_start, 0)),
+                axis=(0,)
+            )
 
-                # Compute S = Q @ K^T using tile_matmul (fp16 tensor cores)
-                K_T = wp.tile_transpose(K_tile)  # [HEAD_DIM, TILE_N]
-                S_tile = wp.tile_zeros(shape=(TILE_M_LOCAL, TILE_N_LOCAL), dtype=wp.float16)
-                wp.tile_matmul(Q_tile, K_T, S_tile)
+            # Row-wise max using tile_reduce, then scale
+            m_block_tile = wp.tile_reduce(wp.max, S_tile, axis=1)  # (TILE_M,) fp16
+            m_block = float(m_block_tile[row]) * sm_scale_log2
 
-                # Row-wise max in fp32 (scores pre-scaled by LOG2E for exp2)
-                m_block = float(-1e10)
-                for n in range(TILE_N_LOCAL):
-                    s = float(S_tile[row_in_tile, n]) * sm_scale_log2
-                    m_block = wp.max(m_block, s)
+            # Online softmax update
+            m_new = wp.max(m_i, m_block)
+            alpha = wp.exp2(m_i - m_new)
 
-                # Online softmax update using exp2 (per-thread, fp32)
-                m_new = wp.max(m_i, m_block)
-                alpha = wp.exp2(m_i - m_new)
+            # Rescale accumulators
+            l_i = l_i * alpha
+            for d in range(HEAD_DIM):
+                o_acc[d] = o_acc[d] * alpha
 
-                # Rescale existing accumulators by alpha
-                l_i = l_i * alpha
-                for d in range(D_PER_THREAD):
-                    o_acc[d] = o_acc[d] * alpha
+            # Per-thread: compute P (fp32) and write back as fp16
+            l_block = float(0.0)
+            for n in range(TILE_N):
+                s_val = float(S_tile[row, n]) * sm_scale_log2
+                p = wp.exp2(s_val - m_new)
+                S_tile[row, n] = wp.float16(p)
+                l_block = l_block + p
+            l_i = l_i + l_block
 
-                # Fused softmax + V accumulation using exp2 (per-row streaming, fp32)
-                # All threads in row compute same p/l_i, each accumulates its d-slice of o_acc
-                for n in range(TILE_N_LOCAL):
-                    s = float(S_tile[row_in_tile, n]) * sm_scale_log2
-                    p = wp.exp2(s - m_new)
-                    l_i = l_i + p
-                    for d in range(D_PER_THREAD):
-                        o_acc[d] = o_acc[d] + p * float(V_tile[n, d_start + d])
+            # PV = P @ V [TILE_M, HEAD_DIM] fp16 tensor cores
+            PV_tile = wp.tile_zeros(shape=(TILE_M, HEAD_DIM), dtype=wp.float16, storage="shared")
+            wp.tile_matmul(S_tile, V_tile, PV_tile)
 
-                # Update running max (per-thread)
-                m_i = m_new
+            # Per-thread: accumulate PV into o_acc (fp32)
+            for d in range(HEAD_DIM):
+                o_acc[d] = o_acc[d] + float(PV_tile[row, d])
 
-            # Final normalization and store (cast fp32 -> fp16, each thread writes its d-slice)
-            for d in range(D_PER_THREAD):
-                O[batch_head, q_row, d_start + d] = wp.float16(o_acc[d] / l_i)
+            m_i = m_new
 
-        return flash_attention_kernel_f16
+        # Final normalization and store as fp16
+        inv_l = float(1.0) / l_i
+        for d in range(HEAD_DIM):
+            O[batch_head, q_start + row, d] = wp.float16(o_acc[d] * inv_l)
 
-    else:
-        @wp.kernel(enable_backward=False)
-        def flash_attention_kernel(
-            Q: wp.array3d(dtype=float),
-            K: wp.array3d(dtype=float),
-            V: wp.array3d(dtype=float),
-            O: wp.array3d(dtype=float),
-            sm_scale: float,
-            seq_len: int,
-            batch_heads: int,
-            num_q_blocks: int,
-            num_k_blocks: int,
-        ):
-            """Flash Attention FP32 with per-thread streaming accumulation.
-
-            Multiple threads per row split head_dim for parallelism.
-            All threads in a row redundantly compute softmax state (m, l, p).
-            Each thread accumulates only its slice of o_acc.
-            Uses exp2 instead of exp for faster math (sm_scale pre-multiplied by LOG2E).
-            """
-            TILE_M_LOCAL = wp.static(tile_m)
-            TILE_N_LOCAL = wp.static(tile_n)
-            HEAD_DIM_LOCAL = wp.static(head_dim)
-            THREADS_PER_ROW = wp.static(threads_per_row)
-            D_PER_THREAD = wp.static(d_per_thread)
-
-            # Thread indexing: threads_per_row threads cooperate on each Q row
-            threads_per_tile = TILE_M_LOCAL * THREADS_PER_ROW
-            tile_idx = wp.tid() // threads_per_tile
-            local_tid = wp.tid() % threads_per_tile
-            row_in_tile = local_tid // THREADS_PER_ROW
-            d_idx = local_tid % THREADS_PER_ROW
-            d_start = d_idx * D_PER_THREAD
-
-            batch_head = tile_idx // num_q_blocks
-            q_block_idx = tile_idx % num_q_blocks
-            q_start = q_block_idx * TILE_M_LOCAL
-            q_row = q_start + row_in_tile
-
-            if batch_head >= batch_heads:
-                return
-            if q_row >= seq_len:
-                return
-
-            # Pre-multiply sm_scale by LOG2E so all exp() become exp2()
-            sm_scale_log2 = sm_scale * 1.44269504
-
-            # Load Q block as tile (reused across all K/V blocks)
-            Q_tile_3d = wp.tile_load(Q, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, q_start, 0))
-            Q_tile = wp.tile_squeeze(Q_tile_3d, axis=(0,))  # [TILE_M, HEAD_DIM]
-
-            # Per-thread accumulators (only D_PER_THREAD elements for o_acc)
-            m_i = float(-1e10)  # Running max (redundant across threads in same row)
-            l_i = float(0.0)    # Running sum of exp (redundant across threads in same row)
-            o_acc = wp.vector(dtype=float, length=D_PER_THREAD_CONST)
-            for d in range(D_PER_THREAD):
-                o_acc[d] = 0.0
-
-            # Iterate over K/V blocks
-            for k_block in range(num_k_blocks):
-                k_start = k_block * TILE_N_LOCAL
-
-                # Load K/V blocks to shared memory
-                K_tile_3d = wp.tile_load(K, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0))
-                K_tile = wp.tile_squeeze(K_tile_3d, axis=(0,))  # [TILE_N, HEAD_DIM]
-                V_tile_3d = wp.tile_load(V, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0))
-                V_tile = wp.tile_squeeze(V_tile_3d, axis=(0,))  # [TILE_N, HEAD_DIM]
-
-                # Compute S = Q @ K^T using tile_matmul
-                K_T = wp.tile_transpose(K_tile)  # [HEAD_DIM, TILE_N]
-                S_tile = wp.tile_zeros(shape=(TILE_M_LOCAL, TILE_N_LOCAL), dtype=float)
-                wp.tile_matmul(Q_tile, K_T, S_tile)
-
-                # Scale S with LOG2E-adjusted scale (scores now in log2 domain)
-                S_tile = S_tile * sm_scale_log2
-
-                # Row-wise max (all threads in row compute redundantly)
-                m_block = float(-1e10)
-                for n in range(TILE_N_LOCAL):
-                    m_block = wp.max(m_block, S_tile[row_in_tile, n])
-
-                # Online softmax update using exp2 (per-thread)
-                m_new = wp.max(m_i, m_block)
-                alpha = wp.exp2(m_i - m_new)
-
-                # Rescale existing accumulators by alpha
-                l_i = l_i * alpha
-                for d in range(D_PER_THREAD):
-                    o_acc[d] = o_acc[d] * alpha
-
-                # Fused softmax + V accumulation using exp2 (per-row streaming)
-                # All threads in row compute same p/l_i, each accumulates its d-slice of o_acc
-                for n in range(TILE_N_LOCAL):
-                    s = S_tile[row_in_tile, n]
-                    p = wp.exp2(s - m_new)
-                    l_i = l_i + p
-                    for d in range(D_PER_THREAD):
-                        o_acc[d] = o_acc[d] + p * V_tile[n, d_start + d]
-
-                # Update running max (per-thread)
-                m_i = m_new
-
-            # Final normalization and store (each thread writes its d-slice)
-            for d in range(D_PER_THREAD):
-                O[batch_head, q_row, d_start + d] = o_acc[d] / l_i
-
-        return flash_attention_kernel
+    return flash_attention_kernel
 
 
-def get_flash_attention_kernel(head_dim: int, tile_m: int = 32, tile_n: int = 32,
-                                use_fp16: bool = False, threads_per_row: int = 1):
+def get_flash_attention_kernel(head_dim: int, tile_m: int = 32, tile_n: int = 32):
     """Get or create flash attention kernel (tile_matmul + per-thread streaming).
 
     Args:
         head_dim: Head dimension (must be in SUPPORTED_HEAD_DIMS)
         tile_m: Query block size
         tile_n: Key/Value block size
-        use_fp16: Use FP16 precision (default False for FP32)
-        threads_per_row: Number of threads cooperating on each row (default 1).
-            block_dim = tile_m * threads_per_row.
     """
-    key = ("flash", head_dim, tile_m, tile_n, use_fp16, threads_per_row)
+    key = ("flash", head_dim, tile_m, tile_n)
     if key not in _kernel_cache:
         if head_dim not in SUPPORTED_HEAD_DIMS:
             raise ValueError(f"head_dim={head_dim} not supported. Use one of {SUPPORTED_HEAD_DIMS}")
-        _kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n, use_fp16, threads_per_row)
+        _kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n)
     return _kernel_cache[key]
 
 
@@ -417,39 +289,28 @@ if __name__ == "__main__":
         if status == "FAIL":
             all_passed = False
 
-        # Test flash attention kernel (tile_matmul + per-thread streaming, threads_per_row split)
-        # Target D_SLICE=8 dims per thread, maximize tile_m within shared memory budget
-        d_slice = 8
-        max_smem = 99 * 1024
-        elem_size = 4  # FP32
-        flash_threads_per_row = head_dim // d_slice
-        flash_tile_m = min(128, 1024 // flash_threads_per_row)
-        flash_tile_n = 64
-        # Reduce tile_m to fit shared memory
-        while flash_tile_m > 16:
-            smem = flash_tile_m * (2 * head_dim + flash_tile_n) * elem_size + 2 * flash_tile_n * head_dim * elem_size
-            if smem <= max_smem:
-                break
-            flash_tile_m //= 2
-        flash_kernel = get_flash_attention_kernel(head_dim, flash_tile_m, flash_tile_n,
-                                                   threads_per_row=flash_threads_per_row)
-        flash_block_dim = flash_tile_m * flash_threads_per_row
-        print(f"    Using TILE_M={flash_tile_m}, TILE_N={flash_tile_n}, THREADS_PER_ROW={flash_threads_per_row}, "
-              f"D_PER_THREAD={d_slice}, block_dim={flash_block_dim} ({flash_block_dim//32} warps)")
+        # Test flash attention kernel (fully tile-based, block_dim = tile_m)
+        flash_tile_m = 32
+        flash_tile_n = 32
+
+        flash_block_dim = flash_tile_m  # block_dim = tile_m (no threads_per_row)
+        flash_kernel = get_flash_attention_kernel(head_dim, flash_tile_m, flash_tile_n)
+        print(f"    Using TILE_M={flash_tile_m}, TILE_N={flash_tile_n}, "
+              f"block_dim={flash_block_dim} ({flash_block_dim//32} warps)")
         flash_padded_seq = ((seq_len + flash_tile_m - 1) // flash_tile_m) * flash_tile_m
         flash_num_q_blocks = flash_padded_seq // flash_tile_m
         flash_num_k_blocks = flash_padded_seq // flash_tile_n
 
-        Q_flash_np = np.zeros((batch_heads, flash_padded_seq, head_dim), dtype=np.float32)
-        K_flash_np = np.zeros((batch_heads, flash_padded_seq, head_dim), dtype=np.float32)
-        V_flash_np = np.zeros((batch_heads, flash_padded_seq, head_dim), dtype=np.float32)
-        Q_flash_np[:, :seq_len, :] = Q_np
-        K_flash_np[:, :seq_len, :] = K_np
-        V_flash_np[:, :seq_len, :] = V_np
+        Q_flash_np = np.zeros((batch_heads, flash_padded_seq, head_dim), dtype=np.float16)
+        K_flash_np = np.zeros((batch_heads, flash_padded_seq, head_dim), dtype=np.float16)
+        V_flash_np = np.zeros((batch_heads, flash_padded_seq, head_dim), dtype=np.float16)
+        Q_flash_np[:, :seq_len, :] = Q_np.astype(np.float16)
+        K_flash_np[:, :seq_len, :] = K_np.astype(np.float16)
+        V_flash_np[:, :seq_len, :] = V_np.astype(np.float16)
 
-        Q_flash = wp.array(Q_flash_np, dtype=float)
-        K_flash = wp.array(K_flash_np, dtype=float)
-        V_flash = wp.array(V_flash_np, dtype=float)
+        Q_flash = wp.array(Q_flash_np, dtype=wp.float16)
+        K_flash = wp.array(K_flash_np, dtype=wp.float16)
+        V_flash = wp.array(V_flash_np, dtype=wp.float16)
         O_flash = wp.zeros_like(Q_flash)
 
         total_flash_threads = batch_heads * flash_num_q_blocks * flash_block_dim
@@ -459,9 +320,9 @@ if __name__ == "__main__":
             inputs=[Q_flash, K_flash, V_flash, O_flash, sm_scale, flash_padded_seq, batch_heads, flash_num_q_blocks, flash_num_k_blocks],
             block_dim=flash_block_dim,
         )
-        O_flash_result = O_flash.numpy()[:, :seq_len, :]
+        O_flash_result = O_flash.numpy()[:, :seq_len, :].astype(np.float32)
         err = np.max(np.abs(O_flash_result - ref_out))
-        status = "PASS" if err < 1e-5 else "FAIL"
+        status = "PASS" if err < 1e-2 else "FAIL"  # fp16 has lower precision
         print(f"  Flash:      err={err:.2e} [{status}]")
         if status == "FAIL":
             all_passed = False
