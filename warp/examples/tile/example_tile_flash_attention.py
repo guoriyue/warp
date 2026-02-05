@@ -18,6 +18,18 @@ import warp as wp
 
 # Constants used by kernels
 NEG_INF = wp.constant(-1.0e10)
+NEG_INF_F16 = wp.constant(wp.float16(-65504.0))
+
+
+@wp.func
+def mul_func_f16(a: wp.float16, b: wp.float16) -> wp.float16:
+    return a * b
+
+
+@wp.func
+def div_func_f16(a: wp.float16, b: wp.float16) -> wp.float16:
+    return a / b
+
 
 # Supported head dimensions
 SUPPORTED_HEAD_DIMS = [32, 64, 128, 256]
@@ -125,6 +137,70 @@ def create_flash_attention_kernel(head_dim: int, tile_m: int = 32, tile_n: int =
         num_q_blocks: int,
         num_k_blocks: int,
     ):
+        # TILE_M_LOCAL = wp.static(tile_m)
+        # TILE_N_LOCAL = wp.static(tile_n)
+        # HEAD_DIM_LOCAL = wp.static(head_dim)
+
+        # tile_idx = wp.tid() // TILE_M_LOCAL
+        # batch_head = tile_idx // num_q_blocks
+        # q_block_idx = tile_idx % num_q_blocks
+        # q_start = q_block_idx * TILE_M_LOCAL
+
+        # if batch_head >= batch_heads:
+        #     return
+
+        # Q_tile_3d = wp.tile_load(Q, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, q_start, 0))
+        # Q_tile = wp.tile_squeeze(Q_tile_3d, axis=(0,))
+
+        # O_acc = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=wp.float16, storage="shared")
+        # m_i = wp.tile_full(shape=(TILE_M_LOCAL, 1), value=NEG_INF, dtype=wp.float16, storage="shared")
+        # l_i = wp.tile_zeros(shape=(TILE_M_LOCAL, 1), dtype=wp.float16, storage="shared")
+
+        # for k_block in range(num_k_blocks):
+        #     k_start = k_block * TILE_N_LOCAL
+
+        #     K_tile_3d = wp.tile_load(K, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0), storage="shared")
+        #     K_tile = wp.tile_squeeze(K_tile_3d, axis=(0,))
+        #     V_tile_3d = wp.tile_load(V, shape=(1, TILE_N_LOCAL, HEAD_DIM_LOCAL), offset=(batch_head, k_start, 0), storage="shared")
+        #     V_tile = wp.tile_squeeze(V_tile_3d, axis=(0,))
+
+        #     K_T = wp.tile_transpose(K_tile)
+        #     S = wp.tile_zeros(shape=(TILE_M_LOCAL, TILE_N_LOCAL), dtype=wp.float16)
+        #     wp.tile_matmul(Q_tile, K_T, S)
+        #     S = S * wp.float16(sm_scale)
+
+        #     m_block = wp.tile_reduce(wp.max, S, axis=1)
+        #     m_block = wp.tile_reshape(m_block, shape=(TILE_M_LOCAL, 1))
+        #     m_new = wp.tile_map(wp.max, m_i, m_block)
+
+        #     alpha = wp.tile_map(wp.exp, m_i - m_new)
+        #     m_broadcast = wp.tile_broadcast(m_new, shape=(TILE_M_LOCAL, TILE_N_LOCAL))
+        #     P = wp.tile_map(wp.exp, S - m_broadcast)
+
+        #     l_block = wp.tile_sum(P, axis=1)
+        #     l_block = wp.tile_reshape(l_block, shape=(TILE_M_LOCAL, 1))
+        #     l_new = wp.tile_map(mul_func_f16, l_i, alpha) + l_block
+        #     wp.tile_assign_to_shared(l_i, l_new)
+
+        #     alpha_broadcast = wp.tile_broadcast(alpha, shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL))
+        #     O_scaled = wp.tile_map(mul_func_f16, O_acc, alpha_broadcast)
+
+        #     # Matmul: temp = P @ V
+        #     temp_PV = wp.tile_zeros(shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL), dtype=wp.float16)
+        #     wp.tile_matmul(P, V_tile, temp_PV)
+
+        #     # O_acc = O_scaled + temp_PV
+        #     O_acc_new = O_scaled + temp_PV
+        #     wp.tile_assign_to_shared(O_acc, O_acc_new)
+
+        #     wp.tile_assign_to_shared(m_i, m_new)
+
+        # l_broadcast = wp.tile_broadcast(l_i, shape=(TILE_M_LOCAL, HEAD_DIM_LOCAL))
+        # O_final = wp.tile_map(div_func_f16, O_acc, l_broadcast)
+
+        # O_final_3d = wp.tile_reshape(O_final, shape=(1, TILE_M_LOCAL, HEAD_DIM_LOCAL))
+        # wp.tile_store(O, O_final_3d, offset=(batch_head, q_start, 0))
+
         """Flash Attention FP16 - hybrid tile_matmul + per-thread softmax.
 
         tile_matmul for QK^T and PV (fp16 tensor cores).
