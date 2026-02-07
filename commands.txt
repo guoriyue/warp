@@ -195,3 +195,129 @@ SeqLen                naive              tiled          tiled_f16             tr
   | 6        | Async GEMM overlap                                  | Very High       | Not available — needs Warp async tile_matmul      |
 
   The first improvement (reordering V load) is a one-line change that should give immediate benefit. Want me to implement any of these?
+
+
+
+
+
+
+
+
+ Now I have all three analyses. Let me synthesize the findings.
+
+  Here's my analysis of what Warp needs, based on studying Triton's 06-fused-attention.py, FA3's mainloop_fwd_sm90_tma_gmma_ws.hpp, and Warp's tile.h/warp.cu/builtins.py:
+
+  ---
+  Why Warp is 8x slower: the gap analysis
+
+  | Technique         | Triton                                         | FA3 Hopper                                     | Warp (current)                                   |
+  |-------------------|------------------------------------------------|------------------------------------------------|--------------------------------------------------|
+  | QK^T matmul       | tl.dot() → WGMMA/WMMA                          | cute::gemm() → WGMMA                           | tile_matmul() → cuBLASDx SMEM GEMM               |
+  | PV matmul         | tl.dot(p, v, acc) → tensor cores               | cute::gemm() → WGMMA w/ beta=1                 | Scalar per-thread loop (64×64 ops)               |
+  | Softmax           | tl.max, tl.sum, exp2 (tile ops)                | Register shuffles + exp2f                      | Scalar per-thread (works, but PV is the problem) |
+  | Memory pipeline   | num_stages=2-4, tl.range(warp_specialize=True) | TMA + 2-3 stage pipeline + warp specialization | Synchronous copy_from_global (no overlap)        |
+  | GEMM-GEMM overlap | Compiler-managed via num_stages                | warpgroup_wait<1>()                            | None — __syncthreads after every matmul          |
+  | Memory loads      | TMA tensor descriptors (desc_k.load())         | TMA (cute::copy + TMA descriptors)             | Regular loads (no TMA, no cp.async)              |
+
+  The two biggest gaps:
+
+  1. PV is scalar — Triton does acc = tl.dot(p, v, acc) which is a single tensor core matmul with accumulation. Warp does a 64×64 scalar loop. This is ~8x of the compute time.
+  2. No compute/memory overlap — Triton's num_stages=2 + warp_specialize=True pipelines K/V loads with compute. FA3 does this with TMA + producer/consumer warps. Warp loads, syncs, computes, syncs — all serial.
+
+  ---
+  What to change in Warp (ordered by impact and feasibility)
+
+  Change 1: Remove forced __syncthreads after tile_matmul (HIGH impact, EASY)
+
+  File: tile.h:4622
+  WP_TILE_SYNC();   // ← remove or make conditional
+
+  Currently every tile_matmul forces a block-wide barrier. This prevents any overlap between matmul output becoming available and subsequent operations.
+
+  The sync is needed when the output tile is in shared memory and other threads will read it. But for the PV accumulation case (tile_matmul(P, V, O_acc) with beta=1), if each thread only reads its own accumulator rows, the sync is unnecessary.
+
+  Proposed change: Add a sync=True/False parameter to tile_matmul in Python (builtins.py) that controls whether the C++ codegen emits WP_TILE_SYNC() after the GEMM call. Default to True for backward compatibility.
+
+  Change 2: Enable tile_matmul for PV with direct accumulation (HIGH impact, MEDIUM)
+
+  This is what makes Triton's acc = tl.dot(p, v, acc) fast. The current kernel does PV as scalar code because:
+  - Writing P values to S_tile per-thread, then having cuBLASDx read S_tile for PV — we need to verify the memory layout is compatible
+  - O_acc rescaling needs to happen between softmax and PV matmul
+
+  What to change:
+  1. After scalar softmax writes P values to S_tile[row, n], add a single __syncthreads
+  2. Call tile_matmul(S_tile, V_tile, O_acc) for PV (tensor core accumulation)
+  3. The O_acc rescaling by alpha needs to happen before PV matmul — this can be done per-thread on shared memory since each thread owns different rows
+
+  The key risk is shared memory layout compatibility between scalar writes and cuBLASDx reads. This needs testing.
+
+  Change 3: Enable cp.async pipeline (WP_USE_ASYNC_PIPELINE) (MEDIUM impact, EASY)
+
+  File: tile.h:70
+  #define WP_USE_ASYNC_PIPELINE 0  // ← change to 1
+
+  The infrastructure already exists (lines 1505-1577). Currently it does commit_group + wait_group 0 (single-stage, immediate wait). Even this gives some benefit because cp.async uses a dedicated copy engine that doesn't consume ALU resources.
+
+  Next step: Separate commit from wait, add a wait_group N parameter to allow multi-stage pipelining.
+
+  Change 4: Dirty-state sync tracking (MEDIUM impact, MEDIUM)
+
+  File: tile.h:183-189 — the design is already documented:
+
+  "A more sophisticated strategy would be to track the 'dirty' state of shared tiles, and synchronize only when necessary."
+
+  Currently, every tile_load, tile_assign_to_shared, and tile_matmul emits __syncthreads. With dirty tracking, syncs would only be emitted when a thread needs to read data written by another thread. For the flash attention pattern, this could eliminate 30-50% of syncs.
+
+  Change 5: Double-buffered tile loads (HIGH impact, HARD)
+
+  What FA3/Triton do: While consuming K_i/V_i for compute, load K_{i+1}/V_{i+1} into a second buffer asynchronously. This hides memory latency entirely.
+
+  What Warp needs:
+  - tile_shared_t needs to support multiple buffers (the SyncProvider concept mentioned at tile.h:187)
+  - A new tile_load_async() builtin that issues the copy but doesn't wait
+  - A tile_wait() builtin to synchronize on a specific load
+  - Shared memory allocation needs to account for N×tile_size instead of 1×tile_size
+
+  Change 6: Support CUBLASDX_API_RMEM for register-based GEMM (HIGH impact, HARD)
+
+  File: warp.cu:4199
+  cublasdxSetOperatorInt64(h, CUBLASDX_OPERATOR_API, CUBLASDX_API_SMEM)  // ← RMEM option
+
+  File: builtins.py:10850-10852
+  a.type.storage = "shared"  # ← allow "register"
+  b.type.storage = "shared"
+  out.type.storage = "shared"
+
+  Currently all GEMM operands are forced through shared memory. cuBLASDx has an RMEM (register memory) API where the accumulator stays in registers. This is what FA3 uses — accum_o is a register fragment that cute::gemm accumulates into directly. No shared memory round-trip for the output accumulator.
+
+  This would allow: tile_matmul(P, V, O_acc) where O_acc is in registers, eliminating the shared memory writes/reads for the output accumulator entirely.
+
+  Change 7: Warp specialization (VERY HIGH impact, VERY HARD)
+
+  This is the most ambitious change. FA3 and Triton both support this:
+  - Triton: tl.range(..., warp_specialize=True) — the compiler handles it
+  - FA3: Manual producer/consumer warp dispatch
+
+  For Warp, this would require:
+  - A way to partition warps within a block into roles
+  - Named barriers (not just __syncthreads) for per-role synchronization
+  - Integration with TMA for producer warps
+  - Major changes to the codegen in builtins.py
+
+  ---
+  Recommended implementation order
+
+  | Phase   | Changes                                                      | Expected result   |
+  |---------|--------------------------------------------------------------|-------------------|
+  | Phase 1 | Remove post-matmul sync (opt-in), enable PV tile_matmul      | 7ms → ~3-4ms      |
+  | Phase 2 | Enable cp.async, dirty-state tracking, double-buffered loads | ~3-4ms → ~1.5-2ms |
+  | Phase 3 | RMEM GEMM API, warp specialization                           | ~1.5-2ms → ~1ms   |
+
+  Phase 1 is the most bang-for-buck: it replaces the 4ms scalar PV loop with a tensor core matmul. Phases 2-3 are framework-level changes that require deeper modifications to tile.h, warp.cu, and builtins.py.
+
+  Want me to start implementing Phase 1 — specifically, getting tile_matmul working for the PV accumulation?
+
+──────────────────────────────
+
+
+

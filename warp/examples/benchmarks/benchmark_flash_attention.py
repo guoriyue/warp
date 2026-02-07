@@ -72,22 +72,27 @@ def estimate_smem(tile_m: int, tile_n: int, head_dim: int, elem_size: int) -> in
 
 
 def compute_flash_config(head_dim: int):
-    """Compute (tile_m, tile_n) for a given head_dim.
+    """Compute (tile_m, tile_n, threads_per_row) for a given head_dim.
 
-    With tile-op kernel, block_dim = tile_m. Hardcoded to tile_m=32, tile_n=32 for now.
+    Target d_per_thread=8 for maximum V loop parallelism.
     """
-    return 32, 32
+    d_slice = 8
+    threads_per_row = head_dim // d_slice
+    tile_m = min(128, 1024 // threads_per_row)
+    tile_n = 64
+    return tile_m, tile_n, threads_per_row
 
-def get_flash_kernel(head_dim: int, tile_m: int = None, tile_n: int = None):
+def get_flash_kernel(head_dim: int, tile_m: int = None, tile_n: int = None,
+                     threads_per_row: int = None):
     """Get or create flash attention kernel (fp16).
 
-    If tile_m/tile_n not specified, computes optimal config from head_dim.
+    If tile_m/tile_n/threads_per_row not specified, computes optimal config from head_dim.
     """
-    if tile_m is None or tile_n is None:
-        tile_m, tile_n = compute_flash_config(head_dim)
-    key = (head_dim, tile_m, tile_n)
+    if tile_m is None or tile_n is None or threads_per_row is None:
+        tile_m, tile_n, threads_per_row = compute_flash_config(head_dim)
+    key = (head_dim, tile_m, tile_n, threads_per_row)
     if key not in _flash_kernel_cache:
-        _flash_kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n)
+        _flash_kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n, threads_per_row)
     return _flash_kernel_cache[key]
 
 ALL_IMPLEMENTATIONS = ["naive", "wp_flash_attn"]
@@ -107,13 +112,14 @@ def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array,
         kernel = get_naive_kernel(head_dim)
         wp.launch(kernel, dim=(seq_len, batch_heads), inputs=[Q, K, V, O, sm_scale, seq_len])
     elif impl == "wp_flash_attn":
-        cfg_tile_m, cfg_tile_n = compute_flash_config(head_dim)
+        cfg_tile_m, cfg_tile_n, cfg_threads_per_row = compute_flash_config(head_dim)
         tile_m = tile_m or cfg_tile_m
         tile_n = tile_n or cfg_tile_n
-        kernel = get_flash_kernel(head_dim, tile_m, tile_n)
+        threads_per_row = cfg_threads_per_row
+        kernel = get_flash_kernel(head_dim, tile_m, tile_n, threads_per_row)
         num_q_blocks = (seq_len + tile_m - 1) // tile_m
         num_k_blocks = (seq_len + tile_n - 1) // tile_n
-        block_dim = tile_m
+        block_dim = tile_m * threads_per_row
         total_threads = batch_heads * num_q_blocks * block_dim
         wp.launch(
             kernel,
@@ -190,7 +196,7 @@ def benchmark(batch: int, heads: int, seq_len: int, impl: str, head_dim: int = 6
 
     # Handle wp_flash_attn kernel (fp16 - needs padded arrays)
     if impl == "wp_flash_attn":
-        tile_m, tile_n = compute_flash_config(head_dim)
+        tile_m, tile_n, _ = compute_flash_config(head_dim)
         padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
 
         Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
@@ -246,9 +252,8 @@ def run_scaling_benchmarks():
     print("\n" + "=" * 100)
     print("SCALING BENCHMARKS (head_dim=64) - comparing against flash_attn reference")
     print("=" * 100)
-    # 256, 512, 1024, 2048, 4096,
     seq_lengths = [8192]
-    batch_heads_configs = [(1, 8)] #, (2, 8), (4, 8)]
+    batch_heads_configs = [(1, 8)]
     head_dim = 64
 
     if not HAS_FLASH_ATTN:
@@ -327,10 +332,10 @@ def main():
     print(f"Implementations: {IMPLEMENTATIONS}")
     print(f"MAX_BLOCK_DIM={MAX_BLOCK_DIM}, MAX_SMEM={MAX_SMEM_BYTES//1024}KB (tile-op kernel, fp16)")
     for hd in [64, 128]:
-        tm, tn = compute_flash_config(hd)
+        tm, tn, tpr = compute_flash_config(hd)
         smem = estimate_smem(tm, tn, hd, 2)  # fp16 = 2 bytes
-        block_dim = tm
-        print(f"  head_dim={hd}: tile_m={tm}, tile_n={tn}, "
+        block_dim = tm * tpr
+        print(f"  head_dim={hd}: tile_m={tm}, tile_n={tn}, threads_per_row={tpr}, "
               f"block_dim={block_dim} ({block_dim//32}w), smem={smem//1024}KB")
 
     run_scaling_benchmarks()
