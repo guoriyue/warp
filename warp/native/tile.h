@@ -600,6 +600,23 @@ template <typename Shape_> struct tile_layout_register_t {
     }
 };
 
+// Opaque register-memory tile for cuBLASDx Tensor API RMEM accumulator.
+// StorageBytes is determined at LTO build time by querying CUBLASDX_TENSOR_TRAIT_STORAGE_BYTES.
+// The layout is opaque; only cuBLASDx device functions can read/write the data.
+// The tile_matmul_rmem, tile_rmem_copy, tile_rmem_scale macros (below) handle the actual operations.
+template <int StorageBytes>
+struct tile_rmem_t {
+    alignas(16) char buf[StorageBytes];
+
+    // Accept any scalar assignment (e.g. from tile_zeros which returns T{}).
+    // Zero-initializes the opaque buffer; for fp16/fp32 zero bits == 0.0.
+    template <typename T>
+    inline CUDA_CALLABLE tile_rmem_t& operator=(const T&) {
+        memset(buf, 0, StorageBytes);
+        return *this;
+    }
+};
+
 // represents a tile stored in registers across a block
 template <typename T, typename L> struct tile_register_t {
     using Type = T;
@@ -1216,6 +1233,19 @@ template <typename T, typename L, bool Owner_ = true> struct tile_shared_t {
         wp::atomic_add(&grad(c), adj_ret);
 
         WP_TILE_SYNC();
+    }
+
+    // direct per-element write (no sync)
+    // caller must follow with tile_sync() before any collective op that reads this tile
+    inline CUDA_CALLABLE void insert(const typename Layout::Coord& c, const Type& val)
+    {
+        data(c) = val;
+    }
+
+    // backward of scalar insertion
+    inline CUDA_CALLABLE void adj_insert(const typename Layout::Coord& c, Type& adj_val)
+    {
+        adj_val += grad(c);
     }
 
     // add scalar value onto a single tile element
@@ -2198,6 +2228,17 @@ inline CUDA_CALLABLE auto tile_load_indexed(array_t<T>& src, IndicesTile& indice
 // {
 //     src.copy_to_global(tile_global_t<T, typename Tile::Layout::Shape>(dest, tile_coord(x)));
 // }
+
+// explicit block-level synchronization barrier for tile operations
+inline CUDA_CALLABLE void tile_sync()
+{
+    WP_TILE_SYNC();
+}
+
+inline CUDA_CALLABLE void adj_tile_sync()
+{
+    // no-op for backward pass
+}
 
 // entry point for tile store operations
 template <typename T, bool BoundsCheck, typename Tile>
@@ -4318,6 +4359,81 @@ void adj_tile_bit_xor_inplace(
 {
 }
 
+// tile_insert: direct per-element write without sync
+// caller must follow with tile_sync() before any collective op that reads this tile
+template <typename Tile> void tile_insert(Tile& t, int i, typename Tile::Type value)
+{
+    t.insert(tile_coord(i), value);
+}
+template <typename Tile> void tile_insert(Tile& t, int i, int j, typename Tile::Type value)
+{
+    t.insert(tile_coord(i, j), value);
+}
+template <typename Tile> void tile_insert(Tile& t, int i, int j, int k, typename Tile::Type value)
+{
+    t.insert(tile_coord(i, j, k), value);
+}
+template <typename Tile> void tile_insert(Tile& t, int i, int j, int k, int l, typename Tile::Type value)
+{
+    t.insert(tile_coord(i, j, k, l), value);
+}
+
+template <typename Tile, typename AdjTile>
+void adj_tile_insert(
+    Tile& t, int i, typename Tile::Type value, AdjTile& adj_t, int adj_i, typename Tile::Type& adj_value
+)
+{
+    adj_t.adj_insert(tile_coord(i), adj_value);
+}
+template <typename Tile, typename AdjTile>
+void adj_tile_insert(
+    Tile& t,
+    int i,
+    int j,
+    typename Tile::Type value,
+    AdjTile& adj_t,
+    int adj_i,
+    int adj_j,
+    typename Tile::Type& adj_value
+)
+{
+    adj_t.adj_insert(tile_coord(i, j), adj_value);
+}
+template <typename Tile, typename AdjTile>
+void adj_tile_insert(
+    Tile& t,
+    int i,
+    int j,
+    int k,
+    typename Tile::Type value,
+    AdjTile& adj_t,
+    int adj_i,
+    int adj_j,
+    int adj_k,
+    typename Tile::Type& adj_value
+)
+{
+    adj_t.adj_insert(tile_coord(i, j, k), adj_value);
+}
+template <typename Tile, typename AdjTile>
+void adj_tile_insert(
+    Tile& t,
+    int i,
+    int j,
+    int k,
+    int l,
+    typename Tile::Type value,
+    AdjTile& adj_t,
+    int adj_i,
+    int adj_j,
+    int adj_k,
+    int adj_l,
+    typename Tile::Type& adj_value
+)
+{
+    adj_t.adj_insert(tile_coord(i, j, k, l), adj_value);
+}
+
 namespace partitioned_gemm {
 
 template <typename T> inline CUDA_CALLABLE const T& index(const T* __restrict__ p, int i, int j, int stride)
@@ -4755,6 +4871,16 @@ void adj_tile_matmul(
 #define adj_tile_fft()
 #define adj_tile_ifft()
 
+// RMEM stubs for CPU
+#define tile_rmem_clear(fn_clear, var_out)
+#define adj_tile_rmem_clear(fn_clear, var_out, adj_fn_clear, adj_var_out)
+#define tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes)
+#define adj_tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, adj_fn_copy_a, adj_fn_copy_b, adj_fn_execute, adj_A, adj_B, adj_var_C, adj_smem_a_sugg_bytes, adj_smem_b_sugg_bytes)
+#define tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size)
+#define adj_tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size, adj_fn_map, adj_fn_bounds, adj_var_C, adj_alpha, adj_logical_size)
+#define tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size)
+#define adj_tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size, adj_fn_map, adj_fn_bounds, adj_var_src, adj_var_dst, adj_logical_size)
+
 #else
 
 // TODO(lcambier): use a properly overaligned complex type that matches cuFFTDx's expectation
@@ -4793,6 +4919,101 @@ void adj_tile_matmul(
      do { \
          tile_fft(function_name, dtype, shared_memory_size, batch_size, ept, adj_Xinout); \
      } while (0)
+
+// ============================================================================
+// RMEM tile macros (cuBLASDx Tensor API)
+// ============================================================================
+// tensor_t for cuBLASDx Tensor API: struct { void* ptr; }
+struct tile_rmem_tensor_t { void* ptr; };
+
+// tile_rmem_clear: call LTO clear on the rmem tile
+#define tile_rmem_clear(fn_clear, var_out) \
+    do { \
+        void fn_clear(tile_rmem_tensor_t); \
+        tile_rmem_tensor_t _tc = { var_out.buf }; \
+        fn_clear(_tc); \
+    } while (0)
+
+#define adj_tile_rmem_clear(fn_clear, var_out, adj_fn_clear, adj_var_out)
+
+// tile_matmul_rmem: C_rmem += A_smem @ B_smem
+// First copies A,B from plain SMEM layout to suggested SMEM layout (separate buffers),
+// then executes matmul. The copy functions rearrange data from the user's tile_load layout
+// to cuBLASDx's optimal layout. Temporary shared memory is allocated for the suggested copies.
+#define tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes) \
+    do { \
+        void fn_copy_a(tile_rmem_tensor_t, tile_rmem_tensor_t); \
+        void fn_copy_b(tile_rmem_tensor_t, tile_rmem_tensor_t); \
+        void fn_execute(tile_rmem_tensor_t, tile_rmem_tensor_t, tile_rmem_tensor_t); \
+        char* _buf_a_sugg = (char*)wp::tile_shared_storage_t::alloc(smem_a_sugg_bytes); \
+        char* _buf_b_sugg = (char*)wp::tile_shared_storage_t::alloc(smem_b_sugg_bytes); \
+        tile_rmem_tensor_t _ta_plain = { A.data.ptr }; \
+        tile_rmem_tensor_t _tb_plain = { B.data.ptr }; \
+        tile_rmem_tensor_t _ta_sugg = { _buf_a_sugg }; \
+        tile_rmem_tensor_t _tb_sugg = { _buf_b_sugg }; \
+        fn_copy_a(_ta_plain, _ta_sugg); \
+        fn_copy_b(_tb_plain, _tb_sugg); \
+        WP_TILE_SYNC(); \
+        tile_rmem_tensor_t _tc = { var_C.buf }; \
+        fn_execute(_ta_sugg, _tb_sugg, _tc); \
+        WP_TILE_SYNC(); \
+        wp::tile_shared_storage_t::alloc(-(smem_a_sugg_bytes)); \
+        wp::tile_shared_storage_t::alloc(-(smem_b_sugg_bytes)); \
+    } while (0)
+
+#define adj_tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, \
+    adj_fn_copy_a, adj_fn_copy_b, adj_fn_execute, adj_A, adj_B, adj_var_C, adj_smem_a_sugg_bytes, adj_smem_b_sugg_bytes)
+
+// tile_rmem_scale: element-wise scale RMEM tile
+// Uses MAP_IDX2CRD to iterate over elements, IS_INDEX_IN_BOUNDS to check validity
+// NOTE: use static_cast<> instead of float() to avoid conflict with the
+// #define float(x) cast_float(x) macro in generated kernel code.
+#define tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size) \
+    do { \
+        void fn_map(tile_rmem_tensor_t, int*, int*, int*, void**); \
+        void fn_bounds(int*, int*); \
+        tile_rmem_tensor_t _tc = { var_C.buf }; \
+        for (int _idx = 0; _idx < (int)(logical_size); _idx++) { \
+            int _in_bounds = 0; \
+            fn_bounds(&_idx, &_in_bounds); \
+            if (!_in_bounds) continue; \
+            int _i, _j; \
+            void* _elem_ptr = nullptr; \
+            fn_map(_tc, &_idx, &_i, &_j, &_elem_ptr); \
+            if (_elem_ptr) { \
+                wp::float16* _p = static_cast<wp::float16*>(_elem_ptr); \
+                *_p = wp::float16(static_cast<wp::float32>(*_p) * static_cast<wp::float32>(alpha)); \
+            } \
+        } \
+    } while (0)
+
+#define adj_tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size, \
+    adj_fn_map, adj_fn_bounds, adj_var_C, adj_alpha, adj_logical_size)
+
+// tile_rmem_copy: copy RMEM tile to shared memory tile using MAP_IDX2CRD
+// Uses element-wise access to handle the layout mismatch between RMEM and strided shared tiles.
+#define tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size) \
+    do { \
+        void fn_map(tile_rmem_tensor_t, int*, int*, int*, void**); \
+        void fn_bounds(int*, int*); \
+        tile_rmem_tensor_t _tc = { var_src.buf }; \
+        for (int _idx = 0; _idx < (int)(logical_size); _idx++) { \
+            int _in_bounds = 0; \
+            fn_bounds(&_idx, &_in_bounds); \
+            if (!_in_bounds) continue; \
+            int _i, _j; \
+            void* _elem_ptr = nullptr; \
+            fn_map(_tc, &_idx, &_i, &_j, &_elem_ptr); \
+            if (_elem_ptr) { \
+                wp::float16* _p = static_cast<wp::float16*>(_elem_ptr); \
+                var_dst.data(wp::tile_coord_t<2>{_i, _j}) = *_p; \
+            } \
+        } \
+        WP_TILE_SYNC(); \
+    } while (0)
+
+#define adj_tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size, \
+    adj_fn_map, adj_fn_bounds, adj_var_src, adj_var_dst, adj_logical_size)
 
 #endif  // !defined(__CUDA_ARCH__)
 

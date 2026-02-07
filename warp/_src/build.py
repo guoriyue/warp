@@ -458,6 +458,176 @@ def build_lto_dot(M, N, K, adtype, bdtype, cdtype, alayout, blayout, clayout, ar
     return lto_symbol, lto_code_data
 
 
+# Module-level cache for RMEM metadata (kept separate from builder.ltoirs which is for binary LTO data)
+_rmem_meta_cache = {}
+
+
+def build_lto_dot_rmem(M, N, K, adtype, bdtype, cdtype, alayout, blayout, arch, num_threads, builder):
+    """Build LTO for RMEM-C matmul via cuBLASDx Tensor API.
+
+    Returns (lto_symbol, lto_code_data, metadata_dict).
+    metadata_dict contains: rmem_storage_bytes, rmem_logical_size,
+    smem_a_storage_bytes, smem_b_storage_bytes, smem_c_storage_bytes,
+    and symbol names: execute_sym, clear_sym, copy_sym, map_sym, bounds_sym.
+    """
+    arch = 120 if arch > 121 else arch
+
+    def cublasdx_type_map(dtype):
+        if dtype == float16:
+            return ("wp::float16", 3, 0)
+        if dtype == float32:
+            return ("wp::float32", 5, 0)
+        if dtype == float64:
+            return ("wp::float64", 6, 0)
+        if dtype == vec2h:
+            return ("wp::vec2h", 3, 1)
+        if dtype == vec2f:
+            return ("wp::vec2f", 5, 1)
+        if dtype == vec2d:
+            return ("wp::vec2d", 6, 1)
+        raise TypeError("Unsupported input type in tile_matmul (rmem)")
+
+    def cublasdx_arrangement_map(layout):
+        if layout == "colmajor":
+            return 0
+        if layout == "rowmajor":
+            return 1
+        raise ValueError("Unsupported layout in tile_matmul (rmem)")
+
+    (a_dtype, a_prec, a_type) = cublasdx_type_map(adtype)
+    (b_dtype, b_prec, b_type) = cublasdx_type_map(bdtype)
+    (c_dtype, c_prec, c_type) = cublasdx_type_map(cdtype)
+    a_arrangement = cublasdx_arrangement_map(alayout)
+    b_arrangement = cublasdx_arrangement_map(blayout)
+
+    if a_type != b_type or a_type != c_type:
+        raise TypeError("tile_matmul(A, B, C) requires all inputs to be real or complex")
+
+    element_type = a_type
+
+    lto_symbol = f"dot_rmem_{M}_{N}_{K}_{arch}_{num_threads}_{a_arrangement}_{b_arrangement}_{a_prec}_{b_prec}_{c_prec}_{element_type}"
+
+    # Check for cached metadata
+    meta_key = lto_symbol + "_meta"
+
+    def compile_lto_dot_rmem(temp_paths):
+        rmem_storage_bytes = ctypes.c_int(0)
+        rmem_logical_size = ctypes.c_int(0)
+        smem_a_storage_bytes = ctypes.c_int(0)
+        smem_b_storage_bytes = ctypes.c_int(0)
+        smem_c_storage_bytes = ctypes.c_int(0)
+        smem_a_sugg_storage_bytes = ctypes.c_int(0)
+        smem_b_sugg_storage_bytes = ctypes.c_int(0)
+
+        result = warp._src.context.runtime.core.wp_cuda_compile_dot_rmem(
+            temp_paths[".lto"].encode("utf-8"),
+            lto_symbol.encode("utf-8"),
+            0,
+            None,
+            None,
+            arch,
+            M,
+            N,
+            K,
+            a_prec,
+            b_prec,
+            c_prec,
+            element_type,
+            a_arrangement,
+            b_arrangement,
+            num_threads,
+            ctypes.byref(rmem_storage_bytes),
+            ctypes.byref(rmem_logical_size),
+            ctypes.byref(smem_a_storage_bytes),
+            ctypes.byref(smem_b_storage_bytes),
+            ctypes.byref(smem_c_storage_bytes),
+            ctypes.byref(smem_a_sugg_storage_bytes),
+            ctypes.byref(smem_b_sugg_storage_bytes),
+        )
+
+        if result:
+            with open(temp_paths[".lto"], "rb") as f:
+                lto_code_data = f.read()
+
+            # Write metadata to the temp path for the .meta extension
+            meta = {
+                "rmem_storage_bytes": rmem_storage_bytes.value,
+                "rmem_logical_size": rmem_logical_size.value,
+                "smem_a_storage_bytes": smem_a_storage_bytes.value,
+                "smem_b_storage_bytes": smem_b_storage_bytes.value,
+                "smem_c_storage_bytes": smem_c_storage_bytes.value,
+                "smem_a_sugg_storage_bytes": smem_a_sugg_storage_bytes.value,
+                "smem_b_sugg_storage_bytes": smem_b_sugg_storage_bytes.value,
+            }
+            print(f"[RMEM DEBUG] rmem_storage_bytes={rmem_storage_bytes.value}, rmem_logical_size={rmem_logical_size.value}, "
+                  f"smem_a={smem_a_storage_bytes.value}, smem_b={smem_b_storage_bytes.value}, smem_c={smem_c_storage_bytes.value}, "
+                  f"smem_a_sugg={smem_a_sugg_storage_bytes.value}, smem_b_sugg={smem_b_sugg_storage_bytes.value}")
+            with open(temp_paths[".meta"], "w") as f:
+                json.dump(meta, f)
+
+            return True, {".lto": lto_code_data, ".meta": meta}
+        return False, {}
+
+    # Early out if already cached in module builder
+    if lto_symbol in builder.ltoirs and meta_key in _rmem_meta_cache:
+        lto_code_data = builder.ltoirs[lto_symbol]
+        meta = _rmem_meta_cache[meta_key]
+    else:
+        # Getter to load cached .meta JSON file
+        def get_meta(path):
+            try:
+                with open(path) as f:
+                    return json.load(f)
+            except Exception:
+                return None
+
+        (result, lto_code_data, meta) = _build_lto_base(
+            lto_symbol, compile_lto_dot_rmem, builder, {".meta": get_meta}
+        )
+
+        if not result:
+            raise RuntimeError(
+                f"Failed to compile RMEM LTO '{lto_symbol}'. "
+                "Set the environment variable LIBMATHDX_LOG_LEVEL=5 and rerun for more details."
+            )
+
+        # Build symbol names
+        meta["copy_a_sym"] = f"{lto_symbol}_copy_a"
+        meta["copy_b_sym"] = f"{lto_symbol}_copy_b"
+        meta["execute_sym"] = f"{lto_symbol}_execute"
+        meta["clear_sym"] = f"{lto_symbol}_clear"
+        meta["copy_sym"] = f"{lto_symbol}_copy"
+        meta["map_sym"] = f"{lto_symbol}_map"
+        meta["bounds_sym"] = f"{lto_symbol}_bounds"
+
+        # Store LTO binary in builder (for linking), meta in separate cache (not for linking)
+        builder.ltoirs[lto_symbol] = lto_code_data
+        _rmem_meta_cache[meta_key] = meta
+
+        # Forward-declare tile_rmem_tensor_t before extern "C" function decls.
+        # ltoirs_decl is emitted before tile.h is included, so we must define the struct here.
+        # The duplicate definition in tile.h is identical (C++ allows identical struct redefs).
+        ts = "tile_rmem_tensor_t"
+        # Emit extern "C" declarations. tile_rmem_tensor_t must be defined before use.
+        # The context.py codegen wraps ltoirs_decl in extern "C" { }, but struct defs
+        # inside extern "C" are fine. We close and reopen to put the struct outside.
+        if "__tile_rmem_tensor_t_def" not in builder.ltoirs_decl:
+            builder.ltoirs_decl["__tile_rmem_tensor_t_def"] = (
+                '} struct tile_rmem_tensor_t { void* ptr; }; extern "C" {'
+            )
+        builder.ltoirs_decl[lto_symbol] = "\n".join([
+            f'extern "C" __device__ void {meta["copy_a_sym"]}({ts} S, {ts} D);',
+            f'extern "C" __device__ void {meta["copy_b_sym"]}({ts} S, {ts} D);',
+            f'extern "C" __device__ void {meta["execute_sym"]}({ts} A, {ts} B, {ts} C);',
+            f'extern "C" __device__ void {meta["clear_sym"]}({ts} C);',
+            f'extern "C" __device__ void {meta["copy_sym"]}({ts} S, {ts} D);',
+            f'extern "C" __device__ void {meta["map_sym"]}({ts} A, int* idx, int* i, int* j, void** ptr);',
+            f'extern "C" __device__ void {meta["bounds_sym"]}(int* idx, int* yes_no);',
+        ])
+
+    return lto_symbol, lto_code_data, meta
+
+
 def build_lto_solver(
     M,
     N,

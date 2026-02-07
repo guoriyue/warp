@@ -2204,7 +2204,16 @@ def tile_zeros_value_func(arg_types: Mapping[str, type], arg_values: Mapping[str
 
     dtype = arg_values["dtype"]
 
-    return tile(dtype=dtype, shape=shape, storage=arg_values["storage"])
+    t = tile(dtype=dtype, shape=shape, storage=arg_values["storage"])
+    # When accumulator is set (to the K dimension), mark tile for RMEM accumulation.
+    # tile_matmul and tile_scale check _rmem_hint to decide between RMEM vs shared path.
+    accumulator = arg_values.get("accumulator", 0)
+    if accumulator:
+        if arg_values["storage"] != "register":
+            raise ValueError("accumulator requires storage='register'")
+        t._rmem_hint = True
+        t._rmem_k = accumulator  # K dimension for RMEM LTO build
+    return t
 
 
 def tile_zeros_dispatch_func(arg_types: Mapping[str, type], return_type: Any, arg_values: Mapping[str, Var]):
@@ -2224,8 +2233,8 @@ def tile_zeros_dispatch_func(arg_types: Mapping[str, type], return_type: Any, ar
 
 add_builtin(
     "tile_zeros",
-    input_types={"shape": tuple[int, ...], "dtype": Any, "storage": str},
-    defaults={"storage": "register", "dtype": float},
+    input_types={"shape": tuple[int, ...], "dtype": Any, "storage": str, "accumulator": int},
+    defaults={"storage": "register", "dtype": float, "accumulator": 0},
     value_func=tile_zeros_value_func,
     dispatch_func=tile_zeros_dispatch_func,
     variadic=False,
@@ -2236,6 +2245,9 @@ add_builtin(
     :param dtype: Data type of output tile's elements (default float)
     :param storage: The storage location for the tile: ``"register"`` for registers
       (default) or ``"shared"`` for shared memory.
+    :param accumulator: When nonzero (with storage="register"), specifies the K
+      dimension for cuBLASDx register memory (RMEM) tensor-core accumulation.
+      The tile will be used as a C accumulator in ``tile_matmul(A[M,K], B[K,N], C[M,N])``.
     :returns: A zero-initialized tile with shape and data type as specified""",
     group="Tile Primitives",
     export=False,
@@ -2244,8 +2256,8 @@ add_builtin(
 # overload for scalar shape
 add_builtin(
     "tile_zeros",
-    input_types={"shape": int, "dtype": Any, "storage": str},
-    defaults={"storage": "register", "dtype": float},
+    input_types={"shape": int, "dtype": Any, "storage": str, "accumulator": int},
+    defaults={"storage": "register", "dtype": float, "accumulator": 0},
     value_func=tile_zeros_value_func,
     dispatch_func=tile_zeros_dispatch_func,
     variadic=False,
@@ -4392,6 +4404,52 @@ add_builtin(
     "tile_add_inplace",
     input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "j": int, "k": int, "l": int, "value": Any},
     value_func=tile_inplace_value_func,
+    group="Tile Primitives",
+    hidden=True,
+    export=False,
+)
+
+
+def tile_insert_value_func(arg_types, arg_values):
+    if not types_equal(arg_types["a"].dtype, arg_types["value"]):
+        raise TypeError(
+            f"'value' must have the same dtype as target tile for tile_insert, got {arg_types['a'].dtype} and {arg_types['value']}"
+        )
+
+    # force the input tile to shared memory
+    arg_types["a"].storage = "shared"
+
+    return None
+
+
+add_builtin(
+    "tile_insert",
+    input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "value": Any},
+    value_func=tile_insert_value_func,
+    group="Tile Primitives",
+    hidden=True,
+    export=False,
+)
+add_builtin(
+    "tile_insert",
+    input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "j": int, "value": Any},
+    value_func=tile_insert_value_func,
+    group="Tile Primitives",
+    hidden=True,
+    export=False,
+)
+add_builtin(
+    "tile_insert",
+    input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "j": int, "k": int, "value": Any},
+    value_func=tile_insert_value_func,
+    group="Tile Primitives",
+    hidden=True,
+    export=False,
+)
+add_builtin(
+    "tile_insert",
+    input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "j": int, "k": int, "l": int, "value": Any},
+    value_func=tile_insert_value_func,
     group="Tile Primitives",
     hidden=True,
     export=False,
@@ -10849,7 +10907,6 @@ def tile_matmul_lto_dispatch_func(
     # set the storage type to the inputs to shared
     a.type.storage = "shared"
     b.type.storage = "shared"
-    out.type.storage = "shared"
     template_args = ()
 
     M, K = a.type.shape[0], a.type.shape[1]
@@ -10859,8 +10916,47 @@ def tile_matmul_lto_dispatch_func(
 
     if arch is None or not warp._src.context.runtime.core.wp_is_mathdx_enabled():
         # CPU/no-MathDx dispatch
+        out.type.storage = "shared"
         return ((0, 0, 0, a, b, out, alpha, beta), template_args, [], 0)
+
+    if out.type.storage == "register" and getattr(out.type, "_rmem_hint", False):
+        # RMEM path: cuBLASDx Tensor API with register accumulator
+        # Use the actual tile layouts from the input tiles (same as regular path)
+        _, _, meta = _get_or_build_rmem_lto(
+            M, N, K, a.type.dtype, b.type.dtype, out.type.dtype,
+            a.type.layout, b.type.layout, arch, num_threads, builder,
+        )
+
+        # Backfill rmem metadata on the output tile type.
+        # This works because C++ declarations are emitted AFTER all dispatch functions run.
+        out.type.rmem_storage_bytes = meta["rmem_storage_bytes"]
+        out.type.rmem_logical_size = meta["rmem_logical_size"]
+        out.type.rmem_meta = meta
+
+        fn_copy_a = meta["copy_a_sym"]
+        fn_copy_b = meta["copy_b_sym"]
+        fn_execute = meta["execute_sym"]
+        smem_a_sugg = meta["smem_a_sugg_storage_bytes"]
+        smem_b_sugg = meta["smem_b_sugg_storage_bytes"]
+
+        # Extra shared memory for suggested-layout copies (allocated at runtime in macro)
+        extra_smem = smem_a_sugg + smem_b_sugg
+
+        return (
+            (Var(fn_copy_a, str, False, True, False),
+             Var(fn_copy_b, str, False, True, False),
+             Var(fn_execute, str, False, True, False),
+             a, b, out,
+             Var(str(smem_a_sugg), str, False, True, False),
+             Var(str(smem_b_sugg), str, False, True, False)),
+            template_args,
+            [],  # LTO already registered by _get_or_build_rmem_lto
+            extra_smem,
+            "tile_matmul_rmem",  # 5th element: override C++ function name
+        )
     else:
+        # Standard shared-memory path
+        out.type.storage = "shared"
 
         def tile_flip_layout(layout):
             if layout == "rowmajor":
@@ -11000,6 +11096,398 @@ add_builtin(
     """,
     group="Tile Primitives",
     export=False,
+)
+
+
+add_builtin(
+    "tile_sync",
+    input_types={},
+    value_type=None,
+    is_differentiable=False,
+    doc="""Synchronize all threads in the current block.
+
+    Emits a ``__syncthreads()`` barrier. Use this when per-thread scalar writes to shared
+    memory tiles need to be visible to all threads before a subsequent tile operation
+    (e.g., writing softmax probabilities before ``tile_matmul``).
+    """,
+    group="Tile Primitives",
+    export=False,
+)
+
+
+##
+## Generic tile_scale / tile_copy (dispatch to RMEM path when appropriate)
+##
+
+
+def tile_scale_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return None
+    t = arg_types["a"]
+    if not is_tile(t):
+        raise TypeError(f"tile_scale() 'a' argument must be a tile, got {t!r}")
+    return None
+
+
+def _ensure_rmem_meta(tile_var, options, builder, caller=""):
+    """Ensure RMEM metadata is available on a tile, building the LTO if needed.
+
+    If tile has _rmem_hint=True and _rmem_k set but rmem_meta is None,
+    builds the RMEM LTO eagerly using the tile's shape (M, N) and stored K.
+    """
+    t = tile_var.type
+    if t.rmem_meta is not None:
+        return  # already set (e.g., by tile_matmul)
+
+    if not getattr(t, "_rmem_hint", False):
+        raise RuntimeError(f"{caller} requires an accumulator tile (use accumulator=K in tile_zeros)")
+
+    K = getattr(t, "_rmem_k", 0)
+    if K == 0:
+        raise RuntimeError(f"{caller} accumulator tile missing K dimension")
+
+    M, N = t.shape
+    arch = options["output_arch"]
+    num_threads = options["block_dim"]
+
+    # Build RMEM LTO with default layout assumptions.
+    # cuBLASDx TENSOR API requires col-major arrangement for both A and B.
+    a_layout = getattr(t, "_rmem_a_layout", "colmajor")
+    b_layout = getattr(t, "_rmem_b_layout", "colmajor")
+    _, _, meta = _get_or_build_rmem_lto(
+        M, N, K, t.dtype, t.dtype, t.dtype,
+        a_layout, b_layout, arch, num_threads, builder,
+    )
+
+    # Backfill the metadata
+    t.rmem_storage_bytes = meta["rmem_storage_bytes"]
+    t.rmem_logical_size = meta["rmem_logical_size"]
+    t.rmem_meta = meta
+
+
+def tile_scale_lto_dispatch_func(
+    arg_types, return_type, return_values, arg_values, options, builder,
+):
+    a = arg_values["a"]
+    alpha = arg_values["alpha"]
+
+    if a.type.storage == "register" and getattr(a.type, "_rmem_hint", False):
+        # RMEM path: ensure metadata is available (build LTO if needed)
+        _ensure_rmem_meta(a, options, builder, caller="tile_scale()")
+        meta = a.type.rmem_meta
+        fn_map = meta["map_sym"]
+        fn_bounds = meta["bounds_sym"]
+        logical_size = a.type.rmem_logical_size
+        return (
+            (
+                Var(fn_map, str, False, True, False),
+                Var(fn_bounds, str, False, True, False),
+                a,
+                alpha,
+                Var(str(logical_size), str, False, True, False),
+            ),
+            (),
+            [],
+            0,
+            "tile_rmem_scale",  # override C++ function name
+        )
+    else:
+        raise RuntimeError("tile_scale() currently only supports register (RMEM) tiles")
+
+
+add_builtin(
+    "tile_scale",
+    input_types={
+        "a": tile(dtype=Float, shape=tuple[int, int]),
+        "alpha": Float,
+    },
+    value_func=tile_scale_value_func,
+    lto_dispatch_func=tile_scale_lto_dispatch_func,
+    variadic=True,
+    is_differentiable=False,
+    hidden=False,
+    doc="""Scale a tile element-wise by a scalar factor.
+
+    Currently supports register (RMEM) tiles populated by ``tile_matmul()``.
+
+    :param a: The tile to scale (modified in-place)
+    :param alpha: The scalar factor
+    """,
+    group="Tile Primitives",
+    export=False,
+)
+
+
+def tile_copy_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return tile(dtype=Any, shape=tuple[int, int])
+    src = arg_types["src"]
+    if not is_tile(src):
+        raise TypeError(f"tile_copy() 'src' argument must be a tile, got {src!r}")
+    return tile(dtype=src.dtype, shape=src.shape, storage="shared")
+
+
+def tile_copy_lto_dispatch_func(
+    arg_types, return_type, return_values, arg_values, options, builder,
+):
+    src = arg_values["src"]
+    dst = return_values[0]
+
+    if src.type.storage == "register" and getattr(src.type, "_rmem_hint", False):
+        # RMEM → shared copy using MAP_IDX2CRD for correct layout
+        _ensure_rmem_meta(src, options, builder, caller="tile_copy()")
+        meta = src.type.rmem_meta
+        fn_map = meta["map_sym"]
+        fn_bounds = meta["bounds_sym"]
+        logical_size = meta["rmem_logical_size"]
+        return (
+            (Var(fn_map, str, False, True, False),
+             Var(fn_bounds, str, False, True, False),
+             src, dst,
+             Var(str(logical_size), str, False, True, False)),
+            (),
+            [],
+            0,
+            "tile_rmem_copy",  # override C++ function name
+        )
+    else:
+        raise RuntimeError("tile_copy() currently only supports register (RMEM) → shared copy")
+
+
+add_builtin(
+    "tile_copy",
+    input_types={
+        "src": tile(dtype=Any, shape=tuple[int, int]),
+    },
+    value_func=tile_copy_value_func,
+    lto_dispatch_func=tile_copy_lto_dispatch_func,
+    variadic=True,
+    is_differentiable=False,
+    hidden=False,
+    doc="""Copy a tile to shared memory.
+
+    When ``src`` is a register (RMEM) tile from ``tile_matmul()``, this copies
+    the opaque register data into a shared memory tile that can be accessed
+    element-wise.
+
+    :param src: The source tile
+    :returns: A shared-memory tile with the same shape and dtype
+    """,
+    group="Tile Primitives",
+    export=False,
+)
+
+
+##
+## RMEM tile operations (cuBLASDx Tensor API) — internal helpers
+##
+
+# Cache for RMEM LTO metadata keyed by (M, N, K, arch, num_threads, ...)
+_rmem_lto_cache = {}
+
+
+def _get_or_build_rmem_lto(M, N, K, adtype, bdtype, cdtype, alayout, blayout, arch, num_threads, builder):
+    """Build RMEM LTO and cache the result. Returns (lto_symbol, lto_code_data, meta)."""
+    key = (M, N, K, adtype, bdtype, cdtype, alayout, blayout, arch, num_threads)
+    if key in _rmem_lto_cache:
+        symbol, data, meta = _rmem_lto_cache[key]
+        # Ensure builder has the LTO
+        if symbol not in builder.ltoirs:
+            builder.ltoirs[symbol] = data
+            ts = "tile_rmem_tensor_t"
+            if "__tile_rmem_tensor_t_def" not in builder.ltoirs_decl:
+                builder.ltoirs_decl["__tile_rmem_tensor_t_def"] = (
+                    '} struct tile_rmem_tensor_t { void* ptr; }; extern "C" {'
+                )
+            builder.ltoirs_decl[symbol] = "\n".join([
+                f'extern "C" __device__ void {meta["copy_a_sym"]}({ts} S, {ts} D);',
+                f'extern "C" __device__ void {meta["copy_b_sym"]}({ts} S, {ts} D);',
+                f'extern "C" __device__ void {meta["execute_sym"]}({ts} A, {ts} B, {ts} C);',
+                f'extern "C" __device__ void {meta["clear_sym"]}({ts} C);',
+                f'extern "C" __device__ void {meta["copy_sym"]}({ts} S, {ts} D);',
+                f'extern "C" __device__ void {meta["map_sym"]}({ts} A, int* idx, int* i, int* j, void** ptr);',
+                f'extern "C" __device__ void {meta["bounds_sym"]}(int* idx, int* yes_no);',
+            ])
+        return symbol, data, meta
+    result = warp._src.build.build_lto_dot_rmem(M, N, K, adtype, bdtype, cdtype, alayout, blayout, arch, num_threads, builder)
+    _rmem_lto_cache[key] = result
+    return result
+
+
+def tile_rmem_clear_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return tile(dtype=Any, shape=tuple[int, int])
+    # Returns an rmem tile type
+    shape = (arg_values["M"], arg_values["N"])
+    dtype = arg_values["dtype"]
+    rmem_bytes = arg_values["rmem_storage_bytes"]
+    t = tile(dtype=dtype, shape=shape, storage="rmem")
+    t.rmem_storage_bytes = rmem_bytes
+    return t
+
+
+def tile_rmem_clear_lto_dispatch_func(
+    arg_types, return_type, return_values, arg_values, options, builder,
+):
+    out = return_values[0]
+    # The rmem_storage_bytes should already be set on the type by value_func
+    # Return: (args, template_args, ltoirs, smem)
+    # The clear LTO function name will be passed from the kernel factory via static()
+    # For now, just pass the clear function name as a compile-time string
+    fn_clear_name = arg_values["fn_clear"]
+
+    return (
+        (Var(fn_clear_name, str, False, True, False), out),
+        (),
+        [],  # LTO is already registered by the factory
+        0,
+    )
+
+
+add_builtin(
+    "tile_rmem_clear",
+    input_types={"fn_clear": str, "M": int, "N": int, "dtype": Any, "rmem_storage_bytes": int},
+    value_func=tile_rmem_clear_value_func,
+    lto_dispatch_func=tile_rmem_clear_lto_dispatch_func,
+    variadic=True,
+    is_differentiable=False,
+    hidden=True,
+    export=False,
+    group="Tile Primitives",
+)
+
+
+def tile_matmul_rmem_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return None
+    return None
+
+
+def tile_matmul_rmem_lto_dispatch_func(
+    arg_types, return_type, return_values, arg_values, options, builder,
+):
+    a = arg_values["a"]
+    b = arg_values["b"]
+    out = arg_values["out"]
+    fn_execute_name = arg_values["fn_execute"]
+
+    # Force A and B to shared
+    a.type.storage = "shared"
+    b.type.storage = "shared"
+
+    return (
+        (Var(fn_execute_name, str, False, True, False), a, b, out),
+        (),
+        [],
+        0,
+    )
+
+
+add_builtin(
+    "tile_matmul_rmem",
+    input_types={
+        "fn_execute": str,
+        "a": tile(dtype=Float, shape=tuple[int, int]),
+        "b": tile(dtype=Float, shape=tuple[int, int]),
+        "out": tile(dtype=Any, shape=tuple[int, int]),
+    },
+    value_func=tile_matmul_rmem_value_func,
+    lto_dispatch_func=tile_matmul_rmem_lto_dispatch_func,
+    variadic=True,
+    is_differentiable=False,
+    hidden=True,
+    export=False,
+    group="Tile Primitives",
+)
+
+
+def tile_rmem_scale_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return None
+    return None
+
+
+def tile_rmem_scale_lto_dispatch_func(
+    arg_types, return_type, return_values, arg_values, options, builder,
+):
+    out = arg_values["out"]
+    alpha = arg_values["alpha"]
+    fn_map_name = arg_values["fn_map"]
+    fn_bounds_name = arg_values["fn_bounds"]
+    logical_size = arg_values["logical_size"]
+
+    return (
+        (
+            Var(fn_map_name, str, False, True, False),
+            Var(fn_bounds_name, str, False, True, False),
+            out,
+            alpha,
+            Var(str(logical_size), str, False, True, False),
+        ),
+        (),
+        [],
+        0,
+    )
+
+
+add_builtin(
+    "tile_rmem_scale",
+    input_types={
+        "fn_map": str,
+        "fn_bounds": str,
+        "out": tile(dtype=Any, shape=tuple[int, int]),
+        "alpha": Float,
+        "logical_size": int,
+    },
+    value_func=tile_rmem_scale_value_func,
+    lto_dispatch_func=tile_rmem_scale_lto_dispatch_func,
+    variadic=True,
+    is_differentiable=False,
+    hidden=True,
+    export=False,
+    group="Tile Primitives",
+)
+
+
+def tile_rmem_copy_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return tile(dtype=Any, shape=tuple[int, int])
+    src_type = arg_types["src"]
+    # Return a shared tile with the same shape/dtype
+    return tile(dtype=arg_values["dtype"], shape=(arg_values["M"], arg_values["N"]), storage="shared")
+
+
+def tile_rmem_copy_lto_dispatch_func(
+    arg_types, return_type, return_values, arg_values, options, builder,
+):
+    src = arg_values["src"]
+    dst = return_values[0]
+    fn_copy_name = arg_values["fn_copy"]
+
+    return (
+        (Var(fn_copy_name, str, False, True, False), src, dst),
+        (),
+        [],
+        0,
+    )
+
+
+add_builtin(
+    "tile_rmem_copy",
+    input_types={
+        "fn_copy": str,
+        "src": tile(dtype=Any, shape=tuple[int, int]),
+        "M": int,
+        "N": int,
+        "dtype": Any,
+    },
+    value_func=tile_rmem_copy_value_func,
+    lto_dispatch_func=tile_rmem_copy_lto_dispatch_func,
+    variadic=True,
+    is_differentiable=False,
+    hidden=True,
+    export=False,
+    group="Tile Primitives",
 )
 
 

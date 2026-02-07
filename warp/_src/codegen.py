@@ -1590,10 +1590,15 @@ class Adjoint:
         # for example by checking whether an argument corresponds to
         # a literal value or references a variable.
         extra_shared_memory = 0
+        override_native_func = None
         if func.lto_dispatch_func is not None:
-            func_args, template_args, _ltoirs, extra_shared_memory = func.lto_dispatch_func(
+            lto_result = func.lto_dispatch_func(
                 func.input_types, return_type, output_list, bound_args, options=adj.builder_options, builder=adj.builder
             )
+            if len(lto_result) == 5:
+                func_args, template_args, _ltoirs, extra_shared_memory, override_native_func = lto_result
+            else:
+                func_args, template_args, _ltoirs, extra_shared_memory = lto_result
         elif func.dispatch_func is not None:
             func_args, template_args = func.dispatch_func(func.input_types, return_type, bound_args)
         else:
@@ -1601,7 +1606,14 @@ class Adjoint:
             template_args = ()
 
         func_args = tuple(adj.register_var(x) for x in func_args)
-        func_name = compute_type_str(func.native_func, template_args)
+        if override_native_func:
+            native = override_native_func
+            # Override also suppresses namespace (needed for macros like tile_matmul_rmem)
+            func_namespace = ""
+        else:
+            native = func.native_func
+            func_namespace = func.namespace
+        func_name = compute_type_str(native, template_args)
         use_initializer_list = func.initializer_list_func(bound_args, return_type)
 
         fwd_args = []
@@ -1623,23 +1635,28 @@ class Adjoint:
         if return_type is None:
             # handles expression (zero output) functions, e.g.: void do_something();
             forward_call = (
-                f"{func.namespace}{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
+                f"{func_namespace}{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
             )
             replay_call = forward_call
             if func.custom_replay_func is not None or func.replay_snippet is not None:
-                replay_call = f"{func.namespace}replay_{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
+                replay_call = f"{func_namespace}replay_{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
 
         elif not isinstance(return_type, Sequence) or len(return_type) == 1:
             # handle simple function (one output)
-            forward_call = f"var_{output} = {func.namespace}{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
+            if override_native_func:
+                # When using a native func override (e.g., C macros), emit as void call.
+                # The macro fills the output via its last parameter (which is the output var).
+                forward_call = f"{func_namespace}{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
+            else:
+                forward_call = f"var_{output} = {func_namespace}{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
             replay_call = forward_call
             if func.custom_replay_func is not None:
-                replay_call = f"var_{output} = {func.namespace}replay_{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
+                replay_call = f"var_{output} = {func_namespace}replay_{func_name}({adj.format_forward_call_args(fwd_args, use_initializer_list)});"
 
         else:
             # handle multiple value functions
             forward_call = (
-                f"{func.namespace}{func_name}({adj.format_forward_call_args(fwd_args + output, use_initializer_list)});"
+                f"{func_namespace}{func_name}({adj.format_forward_call_args(fwd_args + output, use_initializer_list)});"
             )
             replay_call = forward_call
 
@@ -1666,7 +1683,7 @@ class Adjoint:
                 require_original_output_arg=func.require_original_output_arg,
             )
             if arg_str is not None:
-                reverse_call = f"{func.namespace}adj_{func.native_func}({arg_str});"
+                reverse_call = f"{func_namespace}adj_{native}({arg_str});"
                 adj.add_reverse(reverse_call)
 
         # update our smem roofline requirements based on any
