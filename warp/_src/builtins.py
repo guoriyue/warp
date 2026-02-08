@@ -4399,51 +4399,6 @@ add_builtin(
 )
 
 
-def tile_insert_value_func(arg_types, arg_values):
-    if not types_equal(arg_types["a"].dtype, arg_types["value"]):
-        raise TypeError(
-            f"'value' must have the same dtype as target tile for tile_insert, got {arg_types['a'].dtype} and {arg_types['value']}"
-        )
-
-    # force the input tile to shared memory
-    arg_types["a"].storage = "shared"
-
-    return None
-
-
-add_builtin(
-    "tile_insert",
-    input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "value": Any},
-    value_func=tile_insert_value_func,
-    group="Tile Primitives",
-    hidden=True,
-    export=False,
-)
-add_builtin(
-    "tile_insert",
-    input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "j": int, "value": Any},
-    value_func=tile_insert_value_func,
-    group="Tile Primitives",
-    hidden=True,
-    export=False,
-)
-add_builtin(
-    "tile_insert",
-    input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "j": int, "k": int, "value": Any},
-    value_func=tile_insert_value_func,
-    group="Tile Primitives",
-    hidden=True,
-    export=False,
-)
-add_builtin(
-    "tile_insert",
-    input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "j": int, "k": int, "l": int, "value": Any},
-    value_func=tile_insert_value_func,
-    group="Tile Primitives",
-    hidden=True,
-    export=False,
-)
-
 add_builtin(
     "tile_sub_inplace",
     input_types={"a": tile(dtype=Any, shape=tuple[int, ...]), "i": int, "value": Any},

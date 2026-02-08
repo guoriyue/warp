@@ -50,7 +50,6 @@ sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
 from tile.example_tile_flash_attention import (
     get_naive_kernel,
     create_flash_attention_kernel,
-    get_matmul_only_kernel,
     get_flash_attention_mma_kernel,
 )
 
@@ -100,7 +99,7 @@ def get_flash_kernel(head_dim: int, tile_m: int = None, tile_n: int = None,
         _flash_kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n, threads_per_row)
     return _flash_kernel_cache[key]
 
-ALL_IMPLEMENTATIONS = ["naive", "wp_flash_attn", "wp_matmul_only", "wp_flash_mma"]
+ALL_IMPLEMENTATIONS = ["naive", "wp_flash_attn", "wp_flash_mma"]
 if HAS_TRITON:
     ALL_IMPLEMENTATIONS.append("triton")
 if HAS_FLASH_ATTN:
@@ -122,22 +121,6 @@ def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array,
         tile_n = tile_n or cfg_tile_n
         threads_per_row = cfg_threads_per_row
         kernel = get_flash_kernel(head_dim, tile_m, tile_n, threads_per_row)
-        num_q_blocks = (seq_len + tile_m - 1) // tile_m
-        num_k_blocks = (seq_len + tile_n - 1) // tile_n
-        block_dim = tile_m * threads_per_row
-        total_threads = batch_heads * num_q_blocks * block_dim
-        wp.launch(
-            kernel,
-            dim=total_threads,
-            inputs=[Q, K, V, O, sm_scale, seq_len, batch_heads, num_q_blocks, num_k_blocks],
-            block_dim=block_dim,
-        )
-    elif impl == "wp_matmul_only":
-        cfg_tile_m, cfg_tile_n, cfg_threads_per_row = compute_flash_config(head_dim)
-        tile_m = tile_m or cfg_tile_m
-        tile_n = tile_n or cfg_tile_n
-        threads_per_row = cfg_threads_per_row
-        kernel = get_matmul_only_kernel(head_dim, tile_m, tile_n, threads_per_row)
         num_q_blocks = (seq_len + tile_m - 1) // tile_m
         num_k_blocks = (seq_len + tile_n - 1) // tile_n
         block_dim = tile_m * threads_per_row
@@ -227,38 +210,6 @@ def benchmark(batch: int, heads: int, seq_len: int, impl: str, head_dim: int = 6
 
         O_out = O_torch.float().cpu().numpy().reshape(shape)
         error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
-        return mean(timings), error, O_out
-
-    # Handle wp_matmul_only kernel (fp16, same layout as wp_flash_attn but only QK^T)
-    if impl == "wp_matmul_only":
-        tile_m, tile_n, _ = compute_flash_config(head_dim)
-        padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
-
-        Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        Q_padded[:, :seq_len, :] = Q_np.astype(np.float16)
-        K_padded[:, :seq_len, :] = K_np.astype(np.float16)
-        V_padded[:, :seq_len, :] = V_np.astype(np.float16)
-
-        Q = wp.array(Q_padded, dtype=wp.float16)
-        K = wp.array(K_padded, dtype=wp.float16)
-        V = wp.array(V_padded, dtype=wp.float16)
-        O = wp.zeros_like(Q)
-
-        for _ in range(warmup):
-            launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
-        wp.synchronize()
-
-        timings = []
-        for _ in range(iterations):
-            start = time.perf_counter()
-            launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
-            wp.synchronize()
-            timings.append((time.perf_counter() - start) * 1000)
-
-        O_out = O.numpy()[:, :seq_len, :].astype(np.float32)
-        error = float('nan')  # Output is wrong since PV is skipped
         return mean(timings), error, O_out
 
     # Handle wp_flash_mma kernel (fp16 - native PTX MMA, 8 warps)
@@ -437,7 +388,6 @@ def main():
         block_dim = tm * tpr
         print(f"  wp_flash_attn head_dim={hd}: tile_m={tm}, tile_n={tn}, threads_per_row={tpr}, "
               f"d_per_thread=8, block_dim={block_dim} ({block_dim//32}w), smem={smem//1024}KB")
-        print(f"  wp_matmul_only head_dim={hd}: (same config, QK^T only, no PV loop)")
 
     run_scaling_benchmarks()
 
