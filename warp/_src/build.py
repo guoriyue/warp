@@ -599,6 +599,7 @@ def build_lto_dot_rmem(M, N, K, adtype, bdtype, cdtype, alayout, blayout, arch, 
         meta["copy_sym"] = f"{lto_symbol}_copy"
         meta["map_sym"] = f"{lto_symbol}_map"
         meta["bounds_sym"] = f"{lto_symbol}_bounds"
+        meta["axpby_sym"] = f"{lto_symbol}_axpby"
 
         # Store LTO binary in builder (for linking), meta in separate cache (not for linking)
         builder.ltoirs[lto_symbol] = lto_code_data
@@ -623,6 +624,7 @@ def build_lto_dot_rmem(M, N, K, adtype, bdtype, cdtype, alayout, blayout, arch, 
             f'extern "C" __device__ void {meta["copy_sym"]}({ts} S, {ts} D);',
             f'extern "C" __device__ void {meta["map_sym"]}({ts} A, int* idx, int* i, int* j, void** ptr);',
             f'extern "C" __device__ void {meta["bounds_sym"]}(int* idx, int* yes_no);',
+            f'extern "C" __device__ void {meta["axpby_sym"]}(void* alpha, {ts} C, void* beta, {ts} D);',
         ])
 
     return lto_symbol, lto_code_data, meta

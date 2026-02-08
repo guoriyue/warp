@@ -10936,23 +10936,27 @@ def tile_matmul_lto_dispatch_func(
         fn_copy_a = meta["copy_a_sym"]
         fn_copy_b = meta["copy_b_sym"]
         fn_execute = meta["execute_sym"]
+        fn_axpby = meta["axpby_sym"]
         smem_a_sugg = meta["smem_a_sugg_storage_bytes"]
         smem_b_sugg = meta["smem_b_sugg_storage_bytes"]
 
         # Extra shared memory for suggested-layout copies (allocated at runtime in macro)
         extra_smem = smem_a_sugg + smem_b_sugg
 
+        # Use tile_matmul_rmem_beta which supports C = A@B + beta*C via AXPBY
         return (
             (Var(fn_copy_a, str, False, True, False),
              Var(fn_copy_b, str, False, True, False),
              Var(fn_execute, str, False, True, False),
+             Var(fn_axpby, str, False, True, False),
              a, b, out,
              Var(str(smem_a_sugg), str, False, True, False),
-             Var(str(smem_b_sugg), str, False, True, False)),
+             Var(str(smem_b_sugg), str, False, True, False),
+             beta),
             template_args,
             [],  # LTO already registered by _get_or_build_rmem_lto
             extra_smem,
-            "tile_matmul_rmem",  # 5th element: override C++ function name
+            "tile_matmul_rmem_beta",  # 5th element: override C++ function name
         )
     else:
         # Standard shared-memory path
@@ -11093,6 +11097,88 @@ add_builtin(
     :param b: A tile with ``shape=(K, N)``
     :param alpha: Scaling factor (default 1.0)
     :returns: A tile with ``shape=(M, N)``
+    """,
+    group="Tile Primitives",
+    export=False,
+)
+
+
+def tile_flash_attention_mma_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return None
+    return None
+
+
+def tile_flash_attention_mma_dispatch_func(
+    arg_types, return_type, return_values, arg_values, options, builder,
+):
+    Q = arg_values["Q"]
+    K = arg_values["K"]
+    V = arg_values["V"]
+    O = arg_values["O"]
+    sm_scale = arg_values["sm_scale"]
+    seq_len = arg_values["seq_len"]
+    batch_heads = arg_values["batch_heads"]
+    num_q_blocks = arg_values["num_q_blocks"]
+    num_k_blocks = arg_values["num_k_blocks"]
+    batch_head = arg_values["batch_head"]
+    q_block_idx = arg_values["q_block_idx"]
+    tile_m = arg_values["tile_m"]
+    tile_n = arg_values["tile_n"]
+    head_dim = arg_values["head_dim"]
+
+    from warp._src.codegen import Var
+
+    # Compute shared memory needed: Q[TILE_M*HD] + K[TILE_N*HD] + V[TILE_N*HD] + S[TILE_M*TILE_N]
+    # + alpha[TILE_M] + inv_l[TILE_M] (all in half=2 bytes, alpha/inv_l in float=4 bytes)
+    try:
+        tm = int(tile_m.constant)
+        tn = int(tile_n.constant)
+        hd = int(head_dim.constant)
+    except Exception:
+        tm, tn, hd = 128, 64, 64  # defaults
+
+    v_stride = hd + 8  # V_PAD = 8
+    smem_bytes = (tm * hd + tn * hd + tn * v_stride) * 2  # Q + K + V (no S, alpha, inv_l)
+
+    return (
+        (Q, K, V, O, sm_scale, seq_len, batch_heads,
+         num_q_blocks, num_k_blocks, batch_head, q_block_idx,
+         Var(str(tm), str, False, True, False),
+         Var(str(tn), str, False, True, False),
+         Var(str(hd), str, False, True, False)),
+        (),   # no template args
+        [],   # no LTO
+        smem_bytes,
+        "tile_flash_attention_mma",  # override C++ function name (macro)
+    )
+
+
+add_builtin(
+    "tile_flash_attention_mma",
+    input_types={
+        "Q": array(dtype=float16, ndim=3),
+        "K": array(dtype=float16, ndim=3),
+        "V": array(dtype=float16, ndim=3),
+        "O": array(dtype=float16, ndim=3),
+        "sm_scale": float,
+        "seq_len": int,
+        "batch_heads": int,
+        "num_q_blocks": int,
+        "num_k_blocks": int,
+        "batch_head": int,
+        "q_block_idx": int,
+        "tile_m": int,
+        "tile_n": int,
+        "head_dim": int,
+    },
+    value_func=tile_flash_attention_mma_value_func,
+    lto_dispatch_func=tile_flash_attention_mma_dispatch_func,
+    variadic=False,
+    is_differentiable=False,
+    doc="""Fused flash attention kernel using native PTX MMA instructions.
+    Bypasses cuBLASDx LTO for direct tensor core access (sm_80+).
+    Each CTA processes one (batch_head, q_block) pair.
     """,
     group="Tile Primitives",
     export=False,

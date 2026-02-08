@@ -4395,6 +4395,15 @@ bool wp_cuda_compile_dot_rmem(
         bounds_tensors.size(), bounds_tensors.data(), &df_bounds
     ));
 
+    // AXPBY: D = alpha*C + beta*D for in-place scaling of RMEM accumulator
+    // Used for flash attention: O_acc = 0*O_acc + beta*O_acc = beta*O_acc
+    cublasdxDeviceFunction df_axpby;
+    std::array<cublasdxTensor, 2> axpby_tensors = { tensor_c_rmem, tensor_c_rmem };
+    CHECK_CUBLASDX(cublasdxCreateDeviceFunction(
+        h, cublasdxDeviceFunctionType::CUBLASDX_DEVICE_FUNCTION_AXPBY,
+        axpby_tensors.size(), axpby_tensors.data(), &df_axpby
+    ));
+
     // Set symbol names
     char sym[256];
     snprintf(sym, sizeof(sym), "%s_copy_a", symbol_prefix);
@@ -4425,6 +4434,10 @@ bool wp_cuda_compile_dot_rmem(
     CHECK_CUBLASDX(cublasdxSetDeviceFunctionOptionStr(
         df_bounds, cublasdxDeviceFunctionOption::CUBLASDX_DEVICE_FUNCTION_OPTION_SYMBOL_NAME, sym
     ));
+    snprintf(sym, sizeof(sym), "%s_axpby", symbol_prefix);
+    CHECK_CUBLASDX(cublasdxSetDeviceFunctionOptionStr(
+        df_axpby, cublasdxDeviceFunctionOption::CUBLASDX_DEVICE_FUNCTION_OPTION_SYMBOL_NAME, sym
+    ));
 
     // Finalize and get LTO IR
     commondxCode code;
@@ -4433,7 +4446,7 @@ bool wp_cuda_compile_dot_rmem(
     // Set target SM on code object (required by cublasdxFinalizeDeviceFunctions)
     CHECK_CUBLASDX(commondxSetCodeOptionInt64(code, commondxOption::COMMONDX_OPTION_TARGET_SM, (long long)(arch * 10)));
 
-    std::array<cublasdxDeviceFunction, 7> dfs = { df_copy_a, df_copy_b, df_execute, df_clear, df_copy, df_map, df_bounds };
+    std::array<cublasdxDeviceFunction, 8> dfs = { df_copy_a, df_copy_b, df_execute, df_clear, df_copy, df_map, df_bounds, df_axpby };
     CHECK_CUBLASDX(cublasdxFinalizeDeviceFunctions(code, dfs.size(), dfs.data()));
 
     size_t lto_size = 0;

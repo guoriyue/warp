@@ -67,7 +67,7 @@ struct alignas(16) float4 {
 
 #endif
 
-#define WP_USE_ASYNC_PIPELINE 0
+#define WP_USE_ASYNC_PIPELINE 1
 #define WP_USE_REGISTER_GEMM 0
 
 #if defined(__CUDACC_RTC__)
@@ -4696,6 +4696,645 @@ inline CUDA_CALLABLE void scalar_cholesky_solve(TileL& L, TileX& X, TileY& Y)
 }  // namespace partition_gemm
 
 
+// ============================================================================
+// Native MMA Infrastructure (PTX mma.sync.aligned.m16n8k16)
+// Bypasses cuBLASDx LTO for direct tensor core access.
+// Requires sm_80+ (Ampere/Hopper/Blackwell).
+// ============================================================================
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+
+// Fragment types for mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+// Each warp (32 threads) computes a 16x8 output tile.
+struct mma_frag_a_m16n8k16 { unsigned int x[4]; };  // 8 fp16 packed as 4 uint32
+struct mma_frag_b_m16n8k16 { unsigned int x[2]; };  // 4 fp16 packed as 2 uint32
+struct mma_frag_acc_m16n8k16 { float x[4]; };        // 4 fp32
+
+// PTX MMA instruction wrapper: D = A * B + C
+// A [16,16] row-major fp16, B [16,8] col-major fp16, C/D [16,8] fp32
+inline CUDA_CALLABLE void mma_m16n8k16_f16_f32(
+    mma_frag_acc_m16n8k16& d,
+    const mma_frag_a_m16n8k16& a,
+    const mma_frag_b_m16n8k16& b,
+    const mma_frag_acc_m16n8k16& c)
+{
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d.x[0]), "=f"(d.x[1]), "=f"(d.x[2]), "=f"(d.x[3])
+        : "r"(a.x[0]), "r"(a.x[1]), "r"(a.x[2]), "r"(a.x[3]),
+          "r"(b.x[0]), "r"(b.x[1]),
+          "f"(c.x[0]), "f"(c.x[1]), "f"(c.x[2]), "f"(c.x[3])
+    );
+}
+
+// Load A fragment from row-major SMEM for mma.sync.m16n8k16.row
+// PTX ISA mapping (groupID = lane/4, tid = lane%4):
+//   a[0] = {A[groupID,   tid*2],   A[groupID,   tid*2+1]}     (rows 0-7, k 0-7)
+//   a[1] = {A[groupID,   tid*2+8], A[groupID,   tid*2+9]}     (rows 0-7, k 8-15)
+//   a[2] = {A[groupID+8, tid*2],   A[groupID+8, tid*2+1]}     (rows 8-15, k 0-7)
+//   a[3] = {A[groupID+8, tid*2+8], A[groupID+8, tid*2+9]}     (rows 8-15, k 8-15)
+inline CUDA_CALLABLE void load_mma_frag_a_rowmajor(
+    mma_frag_a_m16n8k16& frag,
+    const half* smem,       // pointer to tile start in SMEM
+    int m_offset,           // row offset within tile
+    int k_offset,           // column offset within tile
+    int ld)                 // leading dimension (stride between rows)
+{
+    int lane = threadIdx.x & 31;
+    int group = lane >> 2;       // 0..7
+    int tid = lane & 3;          // 0..3
+
+    const half* row0 = smem + (m_offset + group) * ld + k_offset;
+    const half* row1 = smem + (m_offset + group + 8) * ld + k_offset;
+
+    frag.x[0] = *reinterpret_cast<const unsigned int*>(&row0[tid * 2]);
+    frag.x[1] = *reinterpret_cast<const unsigned int*>(&row0[tid * 2 + 8]);
+    frag.x[2] = *reinterpret_cast<const unsigned int*>(&row1[tid * 2]);
+    frag.x[3] = *reinterpret_cast<const unsigned int*>(&row1[tid * 2 + 8]);
+}
+
+// Load B fragment for mma.sync.m16n8k16.col from col-major data in SMEM.
+// PTX ISA mapping:
+//   b[0] = {B[tid*2,   groupID], B[tid*2+1,   groupID]}    (k rows 0-7)
+//   b[1] = {B[tid*2+8, groupID], B[tid*2+8+1, groupID]}    (k rows 8-15)
+// B col-major: B[k,n] at address n*ldb + k
+inline CUDA_CALLABLE void load_mma_frag_b_colmajor(
+    mma_frag_b_m16n8k16& frag,
+    const half* smem,
+    int k_offset,
+    int n_offset,
+    int ldb)                // leading dimension for col-major (= K typically)
+{
+    int lane = threadIdx.x & 31;
+    int group = lane >> 2;
+    int tid = lane & 3;
+
+    const half* col = smem + (n_offset + group) * ldb + k_offset;
+    frag.x[0] = *reinterpret_cast<const unsigned int*>(&col[tid * 2]);
+    frag.x[1] = *reinterpret_cast<const unsigned int*>(&col[tid * 2 + 8]);
+}
+
+// Helper: pack two half values into a uint32 (low bits = first, high bits = second)
+inline CUDA_CALLABLE unsigned int mma_pack_half2(half a, half b)
+{
+    unsigned int result;
+    asm("{mov.b32 %0, {%1, %2};}\n" : "=r"(result) : "h"(*reinterpret_cast<unsigned short*>(&a)),
+                                                       "h"(*reinterpret_cast<unsigned short*>(&b)));
+    return result;
+}
+
+// Load B fragment from ROW-MAJOR SMEM (B is logically col-major for MMA).
+// Use case: V is stored [K, N] row-major. For MMA B col-major [K, N]:
+//   B[k, n] = V[k, n] = smem[k * ld + n]  (row-major access)
+// But col-major B would have B[k, n] at n * ldb + k.
+// Since they differ, we load individual elements and pack.
+inline CUDA_CALLABLE void load_mma_frag_b_from_rowmajor(
+    mma_frag_b_m16n8k16& frag,
+    const half* smem,       // V stored row-major [K, N]
+    int k_offset,
+    int n_offset,
+    int ld)                 // leading dimension (= N, the number of columns)
+{
+    int lane = threadIdx.x & 31;
+    int group = lane >> 2;       // maps to n dimension
+    int tid = lane & 3;          // maps to k dimension
+
+    // B col-major element B[k, n]:
+    //   b[0] = {B[tid*2,   group], B[tid*2+1,   group]}
+    //   b[1] = {B[tid*2+8, group], B[tid*2+8+1, group]}
+    // From V row-major: B[k, n] = V[k, n] = smem[(k_offset + k) * ld + (n_offset + n)]
+    // For b[0]: k = tid*2, tid*2+1, n = group
+    //   = V[k_offset + tid*2, n_offset + group], V[k_offset + tid*2 + 1, n_offset + group]
+    // These are NOT contiguous in memory (stride = ld between them).
+    // Must load individually and pack.
+
+    int n = n_offset + group;
+    int k0 = k_offset + tid * 2;
+    int k1 = k0 + 1;
+    int k2 = k_offset + tid * 2 + 8;
+    int k3 = k2 + 1;
+
+    half v0 = smem[k0 * ld + n];
+    half v1 = smem[k1 * ld + n];
+    half v2 = smem[k2 * ld + n];
+    half v3 = smem[k3 * ld + n];
+
+    // Pack two half values into uint32
+    frag.x[0] = mma_pack_half2(v0, v1);
+    frag.x[1] = mma_pack_half2(v2, v3);
+}
+
+
+// ============================================================================
+// MMA Accumulator Tile
+// Per-thread fp32 register array for M×N output with NumWarps warps.
+// Each warp computes a subset of 16×8 output tiles.
+// ============================================================================
+
+template <int M, int N, int NumWarps>
+struct tile_mma_acc_t {
+    static_assert(M % 16 == 0, "M must be multiple of 16");
+    static_assert(N % 8 == 0, "N must be multiple of 8");
+
+    static constexpr int m_tiles = M / 16;
+    static constexpr int n_tiles = N / 8;
+    static constexpr int total_tiles = m_tiles * n_tiles;
+    // Round-robin assignment: warp w gets tiles w, w+NumWarps, w+2*NumWarps, ...
+    static constexpr int tiles_per_warp = (total_tiles + NumWarps - 1) / NumWarps;
+    static constexpr int regs_per_thread = tiles_per_warp * 4;
+
+    float data[regs_per_thread];
+
+    inline CUDA_CALLABLE void zero()
+    {
+        WP_PRAGMA_UNROLL
+        for (int i = 0; i < regs_per_thread; i++)
+            data[i] = 0.f;
+    }
+
+    // Scale all accumulator values by a per-row factor.
+    // row_alpha is a SMEM array of M floats: row_alpha[row] = scale for that row.
+    // Each thread's fragment elements map to specific rows based on MMA layout.
+    inline CUDA_CALLABLE void scale_rows(const float* row_alpha)
+    {
+        int warp_id = threadIdx.x / 32;
+        int lane = threadIdx.x & 31;
+        int group = lane >> 2;  // 0..7
+
+        WP_PRAGMA_UNROLL
+        for (int t = 0; t < tiles_per_warp; t++)
+        {
+            int tile_idx = warp_id + t * NumWarps;
+            if (tile_idx >= total_tiles) break;
+
+            int m_tile = tile_idx / n_tiles;
+            int row0 = m_tile * 16 + group;
+            int row1 = row0 + 8;
+
+            float s0 = row_alpha[row0];
+            float s1 = row_alpha[row1];
+
+            data[t * 4 + 0] *= s0;
+            data[t * 4 + 1] *= s0;
+            data[t * 4 + 2] *= s1;
+            data[t * 4 + 3] *= s1;
+        }
+    }
+
+    // Scale all elements by a uniform scalar (for cases where all rows share the same alpha).
+    inline CUDA_CALLABLE void scale_uniform(float alpha)
+    {
+        WP_PRAGMA_UNROLL
+        for (int i = 0; i < regs_per_thread; i++)
+            data[i] *= alpha;
+    }
+
+    // Store accumulator to SMEM as fp16, each thread writes its fragment positions.
+    inline CUDA_CALLABLE void store_to_smem_f16(half* smem_out, int ld) const
+    {
+        int warp_id = threadIdx.x / 32;
+        int lane = threadIdx.x & 31;
+        int group = lane >> 2;
+        int tid = lane & 3;
+
+        WP_PRAGMA_UNROLL
+        for (int t = 0; t < tiles_per_warp; t++)
+        {
+            int tile_idx = warp_id + t * NumWarps;
+            if (tile_idx >= total_tiles) break;
+
+            int m_tile = tile_idx / n_tiles;
+            int n_tile = tile_idx % n_tiles;
+
+            int r0 = m_tile * 16 + group;
+            int c0 = n_tile * 8 + tid * 2;
+            int r1 = r0 + 8;
+
+            smem_out[r0 * ld + c0]     = float_to_half(data[t * 4 + 0]);
+            smem_out[r0 * ld + c0 + 1] = float_to_half(data[t * 4 + 1]);
+            smem_out[r1 * ld + c0]     = float_to_half(data[t * 4 + 2]);
+            smem_out[r1 * ld + c0 + 1] = float_to_half(data[t * 4 + 3]);
+        }
+    }
+
+    // Store to global memory as fp16, with per-row normalization (divide by l_i).
+    // row_inv_l is a SMEM array of M floats: 1.0/l_i for each row.
+    inline CUDA_CALLABLE void store_to_global_f16_normalized(
+        half* global_out, int ld,
+        const float* row_inv_l,
+        int m_global_offset) const
+    {
+        int warp_id = threadIdx.x / 32;
+        int lane = threadIdx.x & 31;
+        int group = lane >> 2;
+        int tid = lane & 3;
+
+        WP_PRAGMA_UNROLL
+        for (int t = 0; t < tiles_per_warp; t++)
+        {
+            int tile_idx = warp_id + t * NumWarps;
+            if (tile_idx >= total_tiles) break;
+
+            int m_tile = tile_idx / n_tiles;
+            int n_tile = tile_idx % n_tiles;
+
+            int r0 = m_tile * 16 + group;
+            int c0 = n_tile * 8 + tid * 2;
+            int r1 = r0 + 8;
+
+            float inv_l0 = row_inv_l[r0];
+            float inv_l1 = row_inv_l[r1];
+
+            global_out[(m_global_offset + r0) * ld + c0]     = float_to_half(data[t * 4 + 0] * inv_l0);
+            global_out[(m_global_offset + r0) * ld + c0 + 1] = float_to_half(data[t * 4 + 1] * inv_l0);
+            global_out[(m_global_offset + r1) * ld + c0]     = float_to_half(data[t * 4 + 2] * inv_l1);
+            global_out[(m_global_offset + r1) * ld + c0 + 1] = float_to_half(data[t * 4 + 3] * inv_l1);
+        }
+    }
+};
+
+
+// ============================================================================
+// Native MMA Matmul Functions
+// ============================================================================
+
+// Compute C[M,N] = A[M,K] @ B^T[K,N] using MMA, write fp16 result to SMEM.
+// A is row-major [M,K] in SMEM. B is row-major [N,K] in SMEM (= B^T col-major [K,N]).
+// Each warp processes its share of 16×8 output tiles; results written to SMEM immediately.
+template <int M, int K, int N, int NumWarps>
+inline CUDA_CALLABLE void tile_matmul_mma_to_smem(
+    const half* __restrict__ smem_a, int lda,
+    const half* __restrict__ smem_b, int ldb,
+    half* __restrict__ smem_c, int ldc)
+{
+    const int warp_id = threadIdx.x / 32;
+
+    constexpr int m_tiles = M / 16;
+    constexpr int n_tiles = N / 8;
+    constexpr int total_tiles = m_tiles * n_tiles;
+    constexpr int k_steps = K / 16;
+    constexpr int tiles_per_warp = (total_tiles + NumWarps - 1) / NumWarps;
+
+    _Pragma("unroll 1")
+    for (int t = 0; t < tiles_per_warp; t++)
+    {
+        int tile_idx = warp_id + t * NumWarps;
+        if (tile_idx >= total_tiles) break;
+
+        int m_tile = tile_idx / n_tiles;
+        int n_tile = tile_idx % n_tiles;
+
+        mma_frag_acc_m16n8k16 c_frag = {0.f, 0.f, 0.f, 0.f};
+
+        WP_PRAGMA_UNROLL
+        for (int k = 0; k < k_steps; k++)
+        {
+            mma_frag_a_m16n8k16 a_frag;
+            mma_frag_b_m16n8k16 b_frag;
+
+            // A: Q[m_tile*16..+16, k*16..+16] row-major
+            load_mma_frag_a_rowmajor(a_frag, smem_a, m_tile * 16, k * 16, lda);
+
+            // B^T: K is [N,K] row-major = K^T col-major. Load as col-major.
+            // Column n_tile*8..+8 of K^T = row n_tile*8..+8 of K.
+            // K[n, k] = K^T col-major at column n, row k => ldb = K's leading dim
+            load_mma_frag_b_colmajor(b_frag, smem_b, k * 16, n_tile * 8, ldb);
+
+            mma_m16n8k16_f16_f32(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        // Write fp32 result as fp16 to SMEM immediately (avoid register pressure)
+        int lane = threadIdx.x & 31;
+        int group = lane >> 2;
+        int tid = lane & 3;
+
+        int r0 = m_tile * 16 + group;
+        int c0 = n_tile * 8 + tid * 2;
+        int r1 = r0 + 8;
+
+        smem_c[r0 * ldc + c0]     = float_to_half(c_frag.x[0]);
+        smem_c[r0 * ldc + c0 + 1] = float_to_half(c_frag.x[1]);
+        smem_c[r1 * ldc + c0]     = float_to_half(c_frag.x[2]);
+        smem_c[r1 * ldc + c0 + 1] = float_to_half(c_frag.x[3]);
+    }
+}
+
+// Accumulate into register tile: acc[M,N] += A[M,K] @ B[K,N]
+// A is row-major [M,K] in SMEM. B is row-major [K,N] in SMEM.
+// B needs transposed fragment loading since MMA expects col-major B.
+template <int M, int K, int N, int NumWarps>
+inline CUDA_CALLABLE void tile_matmul_mma_accumulate(
+    const half* __restrict__ smem_a, int lda,
+    const half* __restrict__ smem_b, int ldb,
+    tile_mma_acc_t<M, N, NumWarps>& acc)
+{
+    const int warp_id = threadIdx.x / 32;
+    constexpr int k_steps = K / 16;
+
+    _Pragma("unroll 1")
+    for (int t = 0; t < tile_mma_acc_t<M, N, NumWarps>::tiles_per_warp; t++)
+    {
+        int tile_idx = warp_id + t * NumWarps;
+        if (tile_idx >= tile_mma_acc_t<M, N, NumWarps>::total_tiles) break;
+
+        int m_tile = tile_idx / tile_mma_acc_t<M, N, NumWarps>::n_tiles;
+        int n_tile = tile_idx % tile_mma_acc_t<M, N, NumWarps>::n_tiles;
+
+        mma_frag_acc_m16n8k16 c_frag = {
+            acc.data[t * 4 + 0], acc.data[t * 4 + 1],
+            acc.data[t * 4 + 2], acc.data[t * 4 + 3]
+        };
+
+        WP_PRAGMA_UNROLL
+        for (int k = 0; k < k_steps; k++)
+        {
+            mma_frag_a_m16n8k16 a_frag;
+            mma_frag_b_m16n8k16 b_frag;
+
+            // A: P[m_tile*16..+16, k*16..+16] row-major
+            load_mma_frag_a_rowmajor(a_frag, smem_a, m_tile * 16, k * 16, lda);
+
+            // B: V[k*16..+16, n_tile*8..+8] row-major -> need transposed load
+            load_mma_frag_b_from_rowmajor(b_frag, smem_b, k * 16, n_tile * 8, ldb);
+
+            mma_m16n8k16_f16_f32(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        acc.data[t * 4 + 0] = c_frag.x[0];
+        acc.data[t * 4 + 1] = c_frag.x[1];
+        acc.data[t * 4 + 2] = c_frag.x[2];
+        acc.data[t * 4 + 3] = c_frag.x[3];
+    }
+}
+
+// ============================================================================
+// Fused Flash Attention MMA Kernel
+// Single function that does the entire flash attention loop for one Q block:
+//   - Load Q to SMEM
+//   - For each K/V block: load K/V, MMA QK^T, softmax, MMA PV
+//   - Normalize and write output
+// Template params: TILE_M, TILE_N, HEAD_DIM
+// Must be launched with block_dim = NUM_WARPS * 32 (8 warps = 256 threads).
+// Each CTA processes one (batch_head, q_block) pair.
+// Register-based softmax: each warp handles 1 m_tile (16 rows) × all n_tiles.
+// Softmax via quad_allreduce (__shfl_xor_sync across 4 threads sharing a row).
+// No SMEM needed for attention scores — only Q, K, V in shared memory.
+// ============================================================================
+template <int TILE_M, int TILE_N, int HEAD_DIM, int NUM_WARPS = 8>
+inline CUDA_CALLABLE void flash_attention_mma_kernel(
+    const half* __restrict__ Q,  // [batch_heads, seq_len, HEAD_DIM]
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half* __restrict__ O,
+    float sm_scale,
+    int seq_len,
+    int batch_heads,
+    int num_q_blocks,
+    int num_k_blocks,
+    int batch_head,         // which batch_head this CTA processes
+    int q_block_idx)        // which Q block this CTA processes
+{
+    const int tid = threadIdx.x;
+    const int q_start = q_block_idx * TILE_M;
+
+    // Shared memory layout: Q[TILE_M, HEAD_DIM] + K[TILE_N, HEAD_DIM] + V[TILE_N, V_STRIDE]
+    // V is padded to avoid bank conflicts
+    static constexpr int V_PAD = 8;
+    static constexpr int V_STRIDE = HEAD_DIM + V_PAD;
+    extern __shared__ char dynamic_smem_base[];
+    half* smem_Q = reinterpret_cast<half*>(dynamic_smem_base);
+    half* smem_K = smem_Q + TILE_M * HEAD_DIM;
+    half* smem_V = smem_K + TILE_N * HEAD_DIM;
+
+    // Warp/lane decomposition
+    const int warp_id = tid / 32;
+    const int lane = tid & 31;
+    const int group = lane >> 2;   // 0-7: maps to rows within 16-row tile
+    const int ltid = lane & 3;    // 0-3: maps to column groups
+
+    // Tile counts
+    static constexpr int N_TILES = TILE_N / 8;       // n_tiles for QK^T scores
+    static constexpr int HD_TILES = HEAD_DIM / 8;     // n_tiles for O accumulator
+    static constexpr int QK_K_STEPS = HEAD_DIM / 16;  // k_steps for QK^T
+    static constexpr int PV_K_STEPS = TILE_N / 16;    // k_steps for PV
+
+    // Register accumulators
+    float O_regs[HD_TILES * 4];   // output accumulator (persistent)
+    float S_regs[N_TILES * 4];    // QK^T scores (reused each k_block)
+    float m_r0 = -1e10f, m_r1 = -1e10f;  // running max for 2 rows (group, group+8)
+    float l_r0 = 0.f, l_r1 = 0.f;        // running sum for 2 rows
+
+    WP_PRAGMA_UNROLL
+    for (int i = 0; i < HD_TILES * 4; i++) O_regs[i] = 0.f;
+
+    const float sm_scale_log2 = sm_scale * 1.44269504f;
+
+    // Load Q block to SMEM [TILE_M, HEAD_DIM]
+    const half* Q_src = Q + (batch_head * seq_len + q_start) * HEAD_DIM;
+    for (int i = tid; i < TILE_M * HEAD_DIM; i += blockDim.x)
+    {
+        int row = i / HEAD_DIM;
+        int col = i % HEAD_DIM;
+        if (q_start + row < seq_len)
+            smem_Q[i] = Q_src[row * HEAD_DIM + col];
+        else
+            smem_Q[i] = float_to_half(0.0f);
+    }
+    __syncthreads();
+
+    for (int k_block = 0; k_block < num_k_blocks; k_block++)
+    {
+        int k_start = k_block * TILE_N;
+
+        // Load K block to SMEM [TILE_N, HEAD_DIM]
+        const half* K_src = K + (batch_head * seq_len + k_start) * HEAD_DIM;
+        for (int i = tid; i < TILE_N * HEAD_DIM; i += blockDim.x)
+        {
+            int row = i / HEAD_DIM;
+            int col = i % HEAD_DIM;
+            if (k_start + row < seq_len)
+                smem_K[i] = K_src[row * HEAD_DIM + col];
+            else
+                smem_K[i] = float_to_half(0.0f);
+        }
+
+        // Load V block to SMEM [TILE_N, V_STRIDE] (padded row-major)
+        const half* V_src = V + (batch_head * seq_len + k_start) * HEAD_DIM;
+        for (int i = tid; i < TILE_N * HEAD_DIM; i += blockDim.x)
+        {
+            int row = i / HEAD_DIM;
+            int col = i % HEAD_DIM;
+            if (k_start + row < seq_len)
+                smem_V[row * V_STRIDE + col] = V_src[row * HEAD_DIM + col];
+            else
+                smem_V[row * V_STRIDE + col] = float_to_half(0.0f);
+        }
+        __syncthreads();
+
+        // ===== QK^T: each warp computes ALL n_tiles for its m_tile =====
+        // warp_id maps to m_tile (16 rows), iterate over all n_tiles (8 columns each)
+        WP_PRAGMA_UNROLL
+        for (int j = 0; j < N_TILES; j++)
+        {
+            mma_frag_acc_m16n8k16 c_frag = {0.f, 0.f, 0.f, 0.f};
+
+            WP_PRAGMA_UNROLL
+            for (int k = 0; k < QK_K_STEPS; k++)
+            {
+                mma_frag_a_m16n8k16 a_frag;
+                mma_frag_b_m16n8k16 b_frag;
+
+                load_mma_frag_a_rowmajor(a_frag, smem_Q, warp_id * 16, k * 16, HEAD_DIM);
+                load_mma_frag_b_colmajor(b_frag, smem_K, k * 16, j * 8, HEAD_DIM);
+
+                mma_m16n8k16_f16_f32(c_frag, a_frag, b_frag, c_frag);
+            }
+
+            S_regs[j * 4 + 0] = c_frag.x[0];  // row group, cols j*8+ltid*2
+            S_regs[j * 4 + 1] = c_frag.x[1];  // row group, cols j*8+ltid*2+1
+            S_regs[j * 4 + 2] = c_frag.x[2];  // row group+8
+            S_regs[j * 4 + 3] = c_frag.x[3];  // row group+8
+        }
+
+        // ===== Softmax: register-based with quad_allreduce =====
+
+        // 1. Scale and find max for each row (r0=group, r1=group+8)
+        float max_r0 = -1e10f, max_r1 = -1e10f;
+        WP_PRAGMA_UNROLL
+        for (int j = 0; j < N_TILES; j++)
+        {
+            S_regs[j * 4 + 0] *= sm_scale_log2;
+            S_regs[j * 4 + 1] *= sm_scale_log2;
+            S_regs[j * 4 + 2] *= sm_scale_log2;
+            S_regs[j * 4 + 3] *= sm_scale_log2;
+            max_r0 = fmaxf(max_r0, fmaxf(S_regs[j * 4 + 0], S_regs[j * 4 + 1]));
+            max_r1 = fmaxf(max_r1, fmaxf(S_regs[j * 4 + 2], S_regs[j * 4 + 3]));
+        }
+
+        // Quad allreduce max across 4 tids (covers all 64 columns)
+        max_r0 = fmaxf(max_r0, __shfl_xor_sync(0xffffffff, max_r0, 1));
+        max_r0 = fmaxf(max_r0, __shfl_xor_sync(0xffffffff, max_r0, 2));
+        max_r1 = fmaxf(max_r1, __shfl_xor_sync(0xffffffff, max_r1, 1));
+        max_r1 = fmaxf(max_r1, __shfl_xor_sync(0xffffffff, max_r1, 2));
+
+        // 2. Rescale O_acc and l_i
+        float m_new_r0 = fmaxf(m_r0, max_r0);
+        float m_new_r1 = fmaxf(m_r1, max_r1);
+        float alpha_r0 = exp2f(m_r0 - m_new_r0);
+        float alpha_r1 = exp2f(m_r1 - m_new_r1);
+        l_r0 *= alpha_r0;
+        l_r1 *= alpha_r1;
+
+        WP_PRAGMA_UNROLL
+        for (int h = 0; h < HD_TILES; h++)
+        {
+            O_regs[h * 4 + 0] *= alpha_r0;
+            O_regs[h * 4 + 1] *= alpha_r0;
+            O_regs[h * 4 + 2] *= alpha_r1;
+            O_regs[h * 4 + 3] *= alpha_r1;
+        }
+
+        // 3. Apply exp2f and accumulate sum
+        float sum_r0 = 0.f, sum_r1 = 0.f;
+        WP_PRAGMA_UNROLL
+        for (int j = 0; j < N_TILES; j++)
+        {
+            S_regs[j * 4 + 0] = exp2f(S_regs[j * 4 + 0] - m_new_r0);
+            S_regs[j * 4 + 1] = exp2f(S_regs[j * 4 + 1] - m_new_r0);
+            S_regs[j * 4 + 2] = exp2f(S_regs[j * 4 + 2] - m_new_r1);
+            S_regs[j * 4 + 3] = exp2f(S_regs[j * 4 + 3] - m_new_r1);
+            sum_r0 += S_regs[j * 4 + 0] + S_regs[j * 4 + 1];
+            sum_r1 += S_regs[j * 4 + 2] + S_regs[j * 4 + 3];
+        }
+
+        sum_r0 += __shfl_xor_sync(0xffffffff, sum_r0, 1);
+        sum_r0 += __shfl_xor_sync(0xffffffff, sum_r0, 2);
+        sum_r1 += __shfl_xor_sync(0xffffffff, sum_r1, 1);
+        sum_r1 += __shfl_xor_sync(0xffffffff, sum_r1, 2);
+
+        l_r0 += sum_r0;
+        l_r1 += sum_r1;
+        m_r0 = m_new_r0;
+        m_r1 = m_new_r1;
+
+        // ===== PV GEMM: A from registers, B from SMEM V =====
+        WP_PRAGMA_UNROLL
+        for (int h = 0; h < HD_TILES; h++)
+        {
+            mma_frag_acc_m16n8k16 c_frag = {
+                O_regs[h * 4 + 0], O_regs[h * 4 + 1],
+                O_regs[h * 4 + 2], O_regs[h * 4 + 3]
+            };
+
+            WP_PRAGMA_UNROLL
+            for (int s = 0; s < PV_K_STEPS; s++)
+            {
+                mma_frag_a_m16n8k16 a_frag;
+                mma_frag_b_m16n8k16 b_frag;
+
+                // A from register scores: k_step s uses n_tiles 2s and 2s+1
+                int sj0 = 2 * s;
+                int sj1 = 2 * s + 1;
+                a_frag.x[0] = mma_pack_half2(float_to_half(S_regs[sj0 * 4 + 0]),
+                                             float_to_half(S_regs[sj0 * 4 + 1]));
+                a_frag.x[1] = mma_pack_half2(float_to_half(S_regs[sj1 * 4 + 0]),
+                                             float_to_half(S_regs[sj1 * 4 + 1]));
+                a_frag.x[2] = mma_pack_half2(float_to_half(S_regs[sj0 * 4 + 2]),
+                                             float_to_half(S_regs[sj0 * 4 + 3]));
+                a_frag.x[3] = mma_pack_half2(float_to_half(S_regs[sj1 * 4 + 2]),
+                                             float_to_half(S_regs[sj1 * 4 + 3]));
+
+                // B from SMEM V (row-major, with padded stride)
+                load_mma_frag_b_from_rowmajor(b_frag, smem_V, s * 16, h * 8, V_STRIDE);
+
+                mma_m16n8k16_f16_f32(c_frag, a_frag, b_frag, c_frag);
+            }
+
+            O_regs[h * 4 + 0] = c_frag.x[0];
+            O_regs[h * 4 + 1] = c_frag.x[1];
+            O_regs[h * 4 + 2] = c_frag.x[2];
+            O_regs[h * 4 + 3] = c_frag.x[3];
+        }
+
+        __syncthreads();  // Ensure all warps done reading K/V before next iteration overwrites
+    }
+
+    // ===== Final output: write from registers to global memory =====
+    float inv_l0 = (l_r0 > 0.f) ? (1.f / l_r0) : 0.f;
+    float inv_l1 = (l_r1 > 0.f) ? (1.f / l_r1) : 0.f;
+    half* O_out = O + (batch_head * seq_len + q_start) * HEAD_DIM;
+    int r0 = warp_id * 16 + group;
+    int r1 = r0 + 8;
+
+    if (q_start + r0 < seq_len)
+    {
+        WP_PRAGMA_UNROLL
+        for (int h = 0; h < HD_TILES; h++)
+        {
+            int c0 = h * 8 + ltid * 2;
+            O_out[r0 * HEAD_DIM + c0]     = float_to_half(O_regs[h * 4 + 0] * inv_l0);
+            O_out[r0 * HEAD_DIM + c0 + 1] = float_to_half(O_regs[h * 4 + 1] * inv_l0);
+        }
+    }
+    if (q_start + r1 < seq_len)
+    {
+        WP_PRAGMA_UNROLL
+        for (int h = 0; h < HD_TILES; h++)
+        {
+            int c0 = h * 8 + ltid * 2;
+            O_out[r1 * HEAD_DIM + c0]     = float_to_half(O_regs[h * 4 + 2] * inv_l1);
+            O_out[r1 * HEAD_DIM + c0 + 1] = float_to_half(O_regs[h * 4 + 3] * inv_l1);
+        }
+    }
+}
+
+#endif  // __CUDA_ARCH__ >= 800
+
+
 template <
     typename Fwd,
     typename AdjA,
@@ -4881,6 +5520,18 @@ void adj_tile_matmul(
 #define tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size)
 #define adj_tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size, adj_fn_map, adj_fn_bounds, adj_var_src, adj_var_dst, adj_logical_size)
 
+// Native MMA stubs for CPU
+#define tile_mma_smem(A, B, C)
+#define adj_tile_mma_smem(A, B, C, adj_A, adj_B, adj_C)
+#define tile_mma_acc_op(A, B, acc)
+#define adj_tile_mma_acc_op(A, B, acc, adj_A, adj_B, adj_acc)
+#define tile_mma_scale_rows(acc, alpha_smem)
+#define adj_tile_mma_scale_rows(acc, alpha_smem, adj_acc, adj_alpha_smem)
+#define tile_mma_store_normalized(acc, out_ptr, inv_l_smem, ld, m_offset)
+#define adj_tile_mma_store_normalized(acc, out_ptr, inv_l_smem, ld, m_offset, adj_acc, adj_out_ptr, adj_inv_l_smem, adj_ld, adj_m_offset)
+#define tile_flash_attention_mma(Q_ptr, K_ptr, V_ptr, O_ptr, sm_scale, seq_len, batch_heads, num_q_blocks, num_k_blocks, batch_head, q_block_idx, TILE_M_val, TILE_N_val, HEAD_DIM_val)
+#define adj_tile_flash_attention_mma(Q_ptr, K_ptr, V_ptr, O_ptr, sm_scale, seq_len, batch_heads, num_q_blocks, num_k_blocks, batch_head, q_block_idx, TILE_M_val, TILE_N_val, HEAD_DIM_val, adj_Q_ptr, adj_K_ptr, adj_V_ptr, adj_O_ptr, adj_sm_scale, adj_seq_len, adj_batch_heads, adj_num_q_blocks, adj_num_k_blocks, adj_batch_head, adj_q_block_idx, adj_TILE_M_val, adj_TILE_N_val, adj_HEAD_DIM_val)
+
 #else
 
 // TODO(lcambier): use a properly overaligned complex type that matches cuFFTDx's expectation
@@ -4964,25 +5615,54 @@ struct tile_rmem_tensor_t { void* ptr; };
 #define adj_tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, \
     adj_fn_copy_a, adj_fn_copy_b, adj_fn_execute, adj_A, adj_B, adj_var_C, adj_smem_a_sugg_bytes, adj_smem_b_sugg_bytes)
 
+// tile_matmul_rmem_beta: C_rmem = A_smem @ B_smem + beta * C_rmem
+// Same as tile_matmul_rmem but with beta scaling of accumulator before execute.
+// Uses AXPBY (D = alpha*C + beta*D) with alpha=0 to scale C_rmem by beta first.
+// This is the standard GEMM equation: C = alpha*A@B + beta*C (with alpha=1 for matmul).
+#define tile_matmul_rmem_beta(fn_copy_a, fn_copy_b, fn_execute, fn_axpby, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, beta) \
+    do { \
+        void fn_copy_a(tile_rmem_tensor_t, tile_rmem_tensor_t); \
+        void fn_copy_b(tile_rmem_tensor_t, tile_rmem_tensor_t); \
+        void fn_execute(tile_rmem_tensor_t, tile_rmem_tensor_t, tile_rmem_tensor_t); \
+        void fn_axpby(void*, tile_rmem_tensor_t, void*, tile_rmem_tensor_t); \
+        char* _buf_a_sugg = (char*)wp::tile_shared_storage_t::alloc(smem_a_sugg_bytes); \
+        char* _buf_b_sugg = (char*)wp::tile_shared_storage_t::alloc(smem_b_sugg_bytes); \
+        tile_rmem_tensor_t _ta_plain = { A.data.ptr }; \
+        tile_rmem_tensor_t _tb_plain = { B.data.ptr }; \
+        tile_rmem_tensor_t _ta_sugg = { _buf_a_sugg }; \
+        tile_rmem_tensor_t _tb_sugg = { _buf_b_sugg }; \
+        fn_copy_a(_ta_plain, _ta_sugg); \
+        fn_copy_b(_tb_plain, _tb_sugg); \
+        WP_TILE_SYNC(); \
+        tile_rmem_tensor_t _tc = { var_C.buf }; \
+        /* Skip AXPBY when beta=1.0 (identity operation) to avoid overhead */ \
+        if (static_cast<float>(beta) != 1.0f) { \
+            wp::float16 _alpha_val = wp::float16(0.0f); \
+            wp::float16 _beta_val = wp::float16(static_cast<float>(beta)); \
+            fn_axpby(&_alpha_val, _tc, &_beta_val, _tc); \
+        } \
+        fn_execute(_ta_sugg, _tb_sugg, _tc); \
+        WP_TILE_SYNC(); \
+        wp::tile_shared_storage_t::alloc(-(smem_a_sugg_bytes)); \
+        wp::tile_shared_storage_t::alloc(-(smem_b_sugg_bytes)); \
+    } while (0)
+
+#define adj_tile_matmul_rmem_beta(fn_copy_a, fn_copy_b, fn_execute, fn_axpby, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, beta, \
+    adj_fn_copy_a, adj_fn_copy_b, adj_fn_execute, adj_fn_axpby, adj_A, adj_B, adj_var_C, adj_smem_a_sugg_bytes, adj_smem_b_sugg_bytes, adj_beta)
+
 // tile_rmem_scale: element-wise scale RMEM tile
-// Uses MAP_IDX2CRD to iterate over elements, IS_INDEX_IN_BOUNDS to check validity
-// NOTE: use static_cast<> instead of float() to avoid conflict with the
-// #define float(x) cast_float(x) macro in generated kernel code.
+// For scalar multiplication, we can directly iterate over the raw buffer
+// since fp16 * scalar is element-wise regardless of layout.
+// Skip scaling when alpha is very close to 1.0 (common in online softmax).
 #define tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size) \
     do { \
-        void fn_map(tile_rmem_tensor_t, int*, int*, int*, void**); \
-        void fn_bounds(int*, int*); \
-        tile_rmem_tensor_t _tc = { var_C.buf }; \
-        for (int _idx = 0; _idx < (int)(logical_size); _idx++) { \
-            int _in_bounds = 0; \
-            fn_bounds(&_idx, &_in_bounds); \
-            if (!_in_bounds) continue; \
-            int _i, _j; \
-            void* _elem_ptr = nullptr; \
-            fn_map(_tc, &_idx, &_i, &_j, &_elem_ptr); \
-            if (_elem_ptr) { \
-                wp::float16* _p = static_cast<wp::float16*>(_elem_ptr); \
-                *_p = wp::float16(static_cast<wp::float32>(*_p) * static_cast<wp::float32>(alpha)); \
+        wp::float32 _alpha32 = static_cast<wp::float32>(alpha); \
+        /* Early exit if alpha is close to 1.0 (common when max doesn't change) */ \
+        if (_alpha32 < 0.99999f || _alpha32 > 1.00001f) { \
+            wp::float16* _buf = reinterpret_cast<wp::float16*>(var_C.buf); \
+            _Pragma("unroll") \
+            for (int _i = 0; _i < (int)(logical_size); _i++) { \
+                _buf[_i] = wp::float16(static_cast<wp::float32>(_buf[_i]) * _alpha32); \
             } \
         } \
     } while (0)
@@ -5014,6 +5694,94 @@ struct tile_rmem_tensor_t { void* ptr; };
 
 #define adj_tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size, \
     adj_fn_map, adj_fn_bounds, adj_var_src, adj_var_dst, adj_logical_size)
+
+// ============================================================================
+// Native MMA macros (GPU path) — called by codegen via override_native_func
+// ============================================================================
+
+// tile_mma_smem: C_smem = A_smem @ B_transposed_smem using native PTX MMA
+// A is tile_shared_t [M, K] fp16 row-major, B is tile_shared_t [N, K] row-major (transposed tile),
+// C is tile_shared_t [M, N] fp16 row-major.
+// B's logical shape after tile_transpose is [K, N], but physically stored as [N, K] row-major.
+#define tile_mma_smem(A, B, C) \
+    do { \
+        using _ShapeA = typename wp::remove_reference<decltype(A)>::type::Layout::Shape; \
+        using _ShapeB_phys = typename wp::remove_reference<decltype(B)>::type::Layout::Shape; \
+        using _ShapeC = typename wp::remove_reference<decltype(C)>::type::Layout::Shape; \
+        constexpr int _M = _ShapeA::dim(0); \
+        constexpr int _K = _ShapeA::dim(1); \
+        constexpr int _N = _ShapeC::dim(1); \
+        wp::tile_matmul_mma_to_smem<_M, _K, _N>( \
+            reinterpret_cast<const half*>(A.data.ptr), _K, \
+            reinterpret_cast<const half*>(B.data.ptr), _K, \
+            reinterpret_cast<half*>(C.data.ptr), _N); \
+        WP_TILE_SYNC(); \
+    } while (0)
+
+#define adj_tile_mma_smem(A, B, C, adj_A, adj_B, adj_C)
+
+// tile_mma_acc_op: acc += A_smem @ B_smem using native PTX MMA with register accumulator
+// A is tile_shared_t [M, K] fp16 row-major, B is tile_shared_t [K, N] fp16 row-major,
+// acc is tile_mma_acc_t<M, N, NumWarps>.
+// B needs transposed fragment loading (row-major to col-major for MMA).
+#define tile_mma_acc_op(A, B, acc) \
+    do { \
+        using _ShapeA = typename wp::remove_reference<decltype(A)>::type::Layout::Shape; \
+        constexpr int _M = _ShapeA::dim(0); \
+        constexpr int _K = _ShapeA::dim(1); \
+        constexpr int _N = (int)(sizeof(acc.data) / sizeof(float) / (wp::tile_mma_acc_t<_M, 8, (WP_TILE_BLOCK_DIM/32)>::tiles_per_warp)); \
+        constexpr int _NumWarps = WP_TILE_BLOCK_DIM / 32; \
+        wp::tile_matmul_mma_accumulate<_M, _K, _N, _NumWarps>( \
+            reinterpret_cast<const half*>(A.data.ptr), _K, \
+            reinterpret_cast<const half*>(B.data.ptr), _N, \
+            acc); \
+    } while (0)
+
+#define adj_tile_mma_acc_op(A, B, acc, adj_A, adj_B, adj_acc)
+
+// tile_mma_scale_rows: scale accumulator by per-row alpha from SMEM
+#define tile_mma_scale_rows(acc, alpha_smem) \
+    do { \
+        acc.scale_rows(reinterpret_cast<const float*>(alpha_smem.data.ptr)); \
+    } while (0)
+
+#define adj_tile_mma_scale_rows(acc, alpha_smem, adj_acc, adj_alpha_smem)
+
+// tile_mma_store_normalized: write accumulator to global memory with per-row normalization
+#define tile_mma_store_normalized(acc, out_ptr, inv_l_smem, ld, m_offset) \
+    do { \
+        acc.store_to_global_f16_normalized( \
+            reinterpret_cast<half*>(out_ptr), ld, \
+            reinterpret_cast<const float*>(inv_l_smem.data.ptr), m_offset); \
+    } while (0)
+
+#define adj_tile_mma_store_normalized(acc, out_ptr, inv_l_smem, ld, m_offset, \
+    adj_acc, adj_out_ptr, adj_inv_l_smem, adj_ld, adj_m_offset)
+
+// tile_flash_attention_mma: fused flash attention kernel using native MMA
+// Calls the C++ template function that does the entire flash attention loop.
+// TILE_M_val, TILE_N_val, HEAD_DIM_val must be compile-time constants.
+#define tile_flash_attention_mma(Q_ptr, K_ptr, V_ptr, O_ptr, sm_scale, seq_len, batch_heads, \
+    num_q_blocks, num_k_blocks, batch_head, q_block_idx, TILE_M_val, TILE_N_val, HEAD_DIM_val) \
+    do { \
+        wp::flash_attention_mma_kernel<TILE_M_val, TILE_N_val, HEAD_DIM_val, (WP_TILE_BLOCK_DIM/32)>( \
+            reinterpret_cast<const wp::half*>((Q_ptr).data), \
+            reinterpret_cast<const wp::half*>((K_ptr).data), \
+            reinterpret_cast<const wp::half*>((V_ptr).data), \
+            reinterpret_cast<wp::half*>((O_ptr).data), \
+            static_cast<float>(sm_scale), \
+            static_cast<int>(seq_len), \
+            static_cast<int>(batch_heads), \
+            static_cast<int>(num_q_blocks), \
+            static_cast<int>(num_k_blocks), \
+            static_cast<int>(batch_head), \
+            static_cast<int>(q_block_idx)); \
+    } while (0)
+
+#define adj_tile_flash_attention_mma(Q_ptr, K_ptr, V_ptr, O_ptr, sm_scale, seq_len, batch_heads, \
+    num_q_blocks, num_k_blocks, batch_head, q_block_idx, TILE_M_val, TILE_N_val, HEAD_DIM_val, \
+    adj_Q_ptr, adj_K_ptr, adj_V_ptr, adj_O_ptr, adj_sm_scale, adj_seq_len, adj_batch_heads, \
+    adj_num_q_blocks, adj_num_k_blocks, adj_batch_head, adj_q_block_idx, adj_TILE_M_val, adj_TILE_N_val, adj_HEAD_DIM_val)
 
 #endif  // !defined(__CUDA_ARCH__)
 
