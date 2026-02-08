@@ -3859,56 +3859,6 @@ add_builtin(
 )
 
 
-def tile_assign_to_shared_value_func(arg_types, arg_values):
-    if arg_types is None:
-        return None
-
-    # Force destination to shared memory
-    # Note: We don't validate source storage here because the storage mutation bug
-    # may have incorrectly changed source tiles to "shared". The C++ templates
-    # (tile_shared_t, tile_register_t) will enforce correct types at compile time.
-    arg_types["dst"].storage = "shared"
-    return None
-
-
-def tile_assign_to_shared_dispatch_func(input_types: Mapping[str, type], return_type: Any, args: Mapping[str, Var]):
-    dst = args["dst"]
-    src = args["src"]
-
-    if "offset" in args:
-        offset = extract_tuple(args["offset"])
-    else:
-        offset = (0,) * len(dst.type.shape)
-
-    func_args = (dst, src, *offset)
-    template_args = []
-
-    return (func_args, template_args)
-
-
-add_builtin(
-    "tile_assign_to_shared",
-    input_types={
-        "dst": tile(dtype=Any, shape=tuple[int, ...]),
-        "src": tile(dtype=Any, shape=tuple[int, ...]),
-        "offset": tuple[int, ...],
-    },
-    value_func=tile_assign_to_shared_value_func,
-    dispatch_func=tile_assign_to_shared_dispatch_func,
-    defaults={"offset": None},
-    doc="""Assign a tile to shared memory.
-
-    Use this when copying computed results (in registers) back to
-    shared memory accumulators in loops.
-
-    :param dst: Destination tile (will be in shared memory)
-    :param src: Source tile
-    :param offset: Optional offset into destination tile""",
-    group="Tile Primitives",
-    export=False,
-)
-
-
 # handles expressions like tile[i,j] = 1.0
 add_builtin(
     "assign",

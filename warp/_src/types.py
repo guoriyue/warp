@@ -4251,9 +4251,6 @@ class tile(Tile[DType, Shape]):
             return f"wp::tile_register_t<{Var.type_to_ctype(self.dtype)},wp::tile_layout_register_t<wp::tile_shape_t<{','.join(map(str, self.shape))}>>>"
         elif self.storage == "shared":
             return f"wp::tile_shared_t<{Var.type_to_ctype(self.dtype)},wp::tile_layout_strided_t<wp::tile_shape_t<{','.join(map(str, self.shape))}>, wp::tile_stride_t<{','.join(map(str, self.strides))}>>, {'true' if self.owner else 'false'}>"
-        elif self.storage == "mma_acc":
-            M, N = self.shape
-            return f"wp::tile_mma_acc_t<{M},{N},(WP_TILE_BLOCK_DIM/32)>"
         else:
             raise RuntimeError(f"Unrecognized tile storage type {self.storage}")
 
@@ -4270,9 +4267,6 @@ class tile(Tile[DType, Shape]):
             else:
                 # tile will be initialized by another call, e.g.: tile_transpose()
                 return "nullptr"
-        elif self.storage == "mma_acc":
-            # MMA accumulator: zero-initialized per-thread fp32 register array
-            return self.ctype() + "{}"
 
     # return total tile size in bytes
     def size_in_bytes(self):
