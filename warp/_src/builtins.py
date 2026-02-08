@@ -11138,8 +11138,11 @@ def tile_flash_attention_mma_dispatch_func(
     except Exception:
         tm, tn, hd = 128, 64, 64  # defaults
 
-    v_stride = hd + 8  # V_PAD = 8
-    smem_bytes = (tm * hd + tn * hd + tn * v_stride) * 2  # Q + K + V (no S, alpha, inv_l)
+    pad = 8
+    q_stride = hd + pad
+    k_stride = hd + pad
+    vt_stride = tn + pad
+    smem_bytes = (tm * q_stride + 2 * tn * k_stride + hd * vt_stride) * 2  # Q + K[2] + VT
 
     return (
         (Q, K, V, O, sm_scale, seq_len, batch_heads,

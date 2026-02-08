@@ -5072,17 +5072,126 @@ inline CUDA_CALLABLE void tile_matmul_mma_accumulate(
 }
 
 // ============================================================================
+// ============================================================================
+// Helper: cp.async 16-byte copy from global to shared memory
+// ============================================================================
+inline CUDA_CALLABLE void cp_async_16B(half* smem_dst, const half* global_src)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    unsigned long long saddr = 0ULL;
+    unsigned long long gaddr = 0ULL;
+    asm volatile("cvta.to.shared.u64 %0, %1;" : "=l"(saddr) : "l"(smem_dst));
+    asm volatile("cvta.to.global.u64 %0, %1;" : "=l"(gaddr) : "l"(global_src));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" : : "l"(saddr), "l"(gaddr));
+#else
+    *reinterpret_cast<float4*>(smem_dst) = *reinterpret_cast<const float4*>(global_src);
+#endif
+}
+
+inline CUDA_CALLABLE void cp_async_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+inline CUDA_CALLABLE void cp_async_wait_group()
+{
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+// ============================================================================
+// Vectorized global→SMEM copy (128-bit / uint4 loads, 8 halfs at a time)
+// NCOLS = source row width, STRIDE = SMEM row stride (padded), NROWS = max rows
+// ============================================================================
+template <int NCOLS, int STRIDE, int NROWS>
+inline CUDA_CALLABLE void copy_global_to_smem_vec(
+    half* smem_dst, const half* global_src,
+    int tid, int block_dim, int valid_rows)
+{
+    static constexpr int VECS_PER_ROW = NCOLS / 8;
+    static constexpr int TOTAL_VECS = NROWS * VECS_PER_ROW;
+    for (int v = tid; v < TOTAL_VECS; v += block_dim)
+    {
+        int row = v / VECS_PER_ROW;
+        int col = (v % VECS_PER_ROW) * 8;
+        if (row < valid_rows)
+            *reinterpret_cast<uint4*>(&smem_dst[row * STRIDE + col]) =
+                *reinterpret_cast<const uint4*>(&global_src[row * NCOLS + col]);
+        else
+        {
+            uint4 zero = {0, 0, 0, 0};
+            *reinterpret_cast<uint4*>(&smem_dst[row * STRIDE + col]) = zero;
+        }
+    }
+}
+
+// ============================================================================
+// Vectorized global→SMEM copy with transposition
+// Source: [NROWS, NCOLS] row-major → Dest: [NCOLS, VT_STRIDE] (transposed)
+// ============================================================================
+template <int NCOLS, int VT_STRIDE, int NROWS>
+inline CUDA_CALLABLE void copy_global_to_smem_transposed_vec(
+    half* smem_vt, const half* global_src,
+    int tid, int block_dim, int valid_rows)
+{
+    static constexpr int VECS_PER_ROW = NCOLS / 8;
+    static constexpr int TOTAL_VECS = NROWS * VECS_PER_ROW;
+    for (int v = tid; v < TOTAL_VECS; v += block_dim)
+    {
+        int n = v / VECS_PER_ROW;
+        int d_base = (v % VECS_PER_ROW) * 8;
+        if (n < valid_rows)
+        {
+            uint4 data = *reinterpret_cast<const uint4*>(&global_src[n * NCOLS + d_base]);
+            const half* h = reinterpret_cast<const half*>(&data);
+            WP_PRAGMA_UNROLL
+            for (int i = 0; i < 8; i++)
+                smem_vt[(d_base + i) * VT_STRIDE + n] = h[i];
+        }
+        else
+        {
+            WP_PRAGMA_UNROLL
+            for (int i = 0; i < 8; i++)
+                smem_vt[(d_base + i) * VT_STRIDE + n] = float_to_half(0.0f);
+        }
+    }
+}
+
+// ============================================================================
+// cp.async vectorized global→SMEM copy (for contiguous layouts like Q, K)
+// ============================================================================
+template <int NCOLS, int STRIDE, int NROWS>
+inline CUDA_CALLABLE void cp_async_global_to_smem_vec(
+    half* smem_dst, const half* global_src,
+    int tid, int block_dim, int valid_rows)
+{
+    static constexpr int VECS_PER_ROW = NCOLS / 8;
+    static constexpr int TOTAL_VECS = NROWS * VECS_PER_ROW;
+    for (int v = tid; v < TOTAL_VECS; v += block_dim)
+    {
+        int row = v / VECS_PER_ROW;
+        int col = (v % VECS_PER_ROW) * 8;
+        if (row < valid_rows)
+            cp_async_16B(&smem_dst[row * STRIDE + col], &global_src[row * NCOLS + col]);
+        else
+        {
+            uint4 zero = {0, 0, 0, 0};
+            *reinterpret_cast<uint4*>(&smem_dst[row * STRIDE + col]) = zero;
+        }
+    }
+}
+
 // Fused Flash Attention MMA Kernel
 // Single function that does the entire flash attention loop for one Q block:
-//   - Load Q to SMEM
-//   - For each K/V block: load K/V, MMA QK^T, softmax, MMA PV
+//   - Load Q to SMEM (vectorized)
+//   - For each K/V block: cp.async K, vectorized V transpose, MMA QK^T, softmax, MMA PV
 //   - Normalize and write output
 // Template params: TILE_M, TILE_N, HEAD_DIM
 // Must be launched with block_dim = NUM_WARPS * 32 (8 warps = 256 threads).
 // Each CTA processes one (batch_head, q_block) pair.
 // Register-based softmax: each warp handles 1 m_tile (16 rows) × all n_tiles.
-// Softmax via quad_allreduce (__shfl_xor_sync across 4 threads sharing a row).
-// No SMEM needed for attention scores — only Q, K, V in shared memory.
+// Optimizations: SMEM padding (bank conflicts), V transpose (contiguous B loads),
+//   vectorized global loads (uint4), cp.async pipelining (double-buffered K).
 // ============================================================================
 template <int TILE_M, int TILE_N, int HEAD_DIM, int NUM_WARPS = 8>
 inline CUDA_CALLABLE void flash_attention_mma_kernel(
@@ -5101,14 +5210,20 @@ inline CUDA_CALLABLE void flash_attention_mma_kernel(
     const int tid = threadIdx.x;
     const int q_start = q_block_idx * TILE_M;
 
-    // Shared memory layout: Q[TILE_M, HEAD_DIM] + K[TILE_N, HEAD_DIM] + V[TILE_N, V_STRIDE]
-    // V is padded to avoid bank conflicts
-    static constexpr int V_PAD = 8;
-    static constexpr int V_STRIDE = HEAD_DIM + V_PAD;
+    // Shared memory layout (all padded to avoid bank conflicts):
+    //   Q:     [TILE_M, Q_STRIDE]
+    //   K[2]:  [2 × TILE_N, K_STRIDE]  (double-buffered for cp.async)
+    //   VT:    [HEAD_DIM, VT_STRIDE]   (V stored transposed)
+    static constexpr int PAD = 8;
+    static constexpr int Q_STRIDE = HEAD_DIM + PAD;    // 72
+    static constexpr int K_STRIDE = HEAD_DIM + PAD;    // 72
+    static constexpr int VT_STRIDE = TILE_N + PAD;     // 72
+
     extern __shared__ char dynamic_smem_base[];
-    half* smem_Q = reinterpret_cast<half*>(dynamic_smem_base);
-    half* smem_K = smem_Q + TILE_M * HEAD_DIM;
-    half* smem_V = smem_K + TILE_N * HEAD_DIM;
+    half* smem_Q   = reinterpret_cast<half*>(dynamic_smem_base);
+    half* smem_K0  = smem_Q  + TILE_M * Q_STRIDE;                    // K buffer 0
+    half* smem_K1  = smem_K0 + TILE_N * K_STRIDE;                    // K buffer 1
+    half* smem_VT  = smem_K1 + TILE_N * K_STRIDE;                    // V transposed
 
     // Warp/lane decomposition
     const int warp_id = tid / 32;
@@ -5133,50 +5248,29 @@ inline CUDA_CALLABLE void flash_attention_mma_kernel(
 
     const float sm_scale_log2 = sm_scale * 1.44269504f;
 
-    // Load Q block to SMEM [TILE_M, HEAD_DIM]
+    // ===== PROLOGUE: Load Q (sync vectorized) =====
     const half* Q_src = Q + (batch_head * seq_len + q_start) * HEAD_DIM;
-    for (int i = tid; i < TILE_M * HEAD_DIM; i += blockDim.x)
+    int q_valid = (q_start + TILE_M <= seq_len) ? TILE_M : (seq_len - q_start);
+    copy_global_to_smem_vec<HEAD_DIM, Q_STRIDE, TILE_M>(smem_Q, Q_src, tid, blockDim.x, q_valid);
+
+    // ===== PROLOGUE: cp.async K[0] → K_buf[0] =====
     {
-        int row = i / HEAD_DIM;
-        int col = i % HEAD_DIM;
-        if (q_start + row < seq_len)
-            smem_Q[i] = Q_src[row * HEAD_DIM + col];
-        else
-            smem_Q[i] = float_to_half(0.0f);
+        int k_start_0 = 0;
+        const half* K_src_0 = K + (batch_head * seq_len + k_start_0) * HEAD_DIM;
+        int k_valid_0 = (k_start_0 + TILE_N <= seq_len) ? TILE_N : (seq_len - k_start_0);
+        cp_async_global_to_smem_vec<HEAD_DIM, K_STRIDE, TILE_N>(smem_K0, K_src_0, tid, blockDim.x, k_valid_0);
+        cp_async_commit();
+        cp_async_wait_group<0>();
     }
     __syncthreads();
 
     for (int k_block = 0; k_block < num_k_blocks; k_block++)
     {
         int k_start = k_block * TILE_N;
-
-        // Load K block to SMEM [TILE_N, HEAD_DIM]
-        const half* K_src = K + (batch_head * seq_len + k_start) * HEAD_DIM;
-        for (int i = tid; i < TILE_N * HEAD_DIM; i += blockDim.x)
-        {
-            int row = i / HEAD_DIM;
-            int col = i % HEAD_DIM;
-            if (k_start + row < seq_len)
-                smem_K[i] = K_src[row * HEAD_DIM + col];
-            else
-                smem_K[i] = float_to_half(0.0f);
-        }
-
-        // Load V block to SMEM [TILE_N, V_STRIDE] (padded row-major)
-        const half* V_src = V + (batch_head * seq_len + k_start) * HEAD_DIM;
-        for (int i = tid; i < TILE_N * HEAD_DIM; i += blockDim.x)
-        {
-            int row = i / HEAD_DIM;
-            int col = i % HEAD_DIM;
-            if (k_start + row < seq_len)
-                smem_V[row * V_STRIDE + col] = V_src[row * HEAD_DIM + col];
-            else
-                smem_V[row * V_STRIDE + col] = float_to_half(0.0f);
-        }
-        __syncthreads();
+        half* smem_K_cur = (k_block & 1) ? smem_K1 : smem_K0;
+        half* smem_K_nxt = (k_block & 1) ? smem_K0 : smem_K1;
 
         // ===== QK^T: each warp computes ALL n_tiles for its m_tile =====
-        // warp_id maps to m_tile (16 rows), iterate over all n_tiles (8 columns each)
         WP_PRAGMA_UNROLL
         for (int j = 0; j < N_TILES; j++)
         {
@@ -5188,19 +5282,35 @@ inline CUDA_CALLABLE void flash_attention_mma_kernel(
                 mma_frag_a_m16n8k16 a_frag;
                 mma_frag_b_m16n8k16 b_frag;
 
-                load_mma_frag_a_rowmajor(a_frag, smem_Q, warp_id * 16, k * 16, HEAD_DIM);
-                load_mma_frag_b_colmajor(b_frag, smem_K, k * 16, j * 8, HEAD_DIM);
+                load_mma_frag_a_rowmajor(a_frag, smem_Q, warp_id * 16, k * 16, Q_STRIDE);
+                load_mma_frag_b_colmajor(b_frag, smem_K_cur, k * 16, j * 8, K_STRIDE);
 
                 mma_m16n8k16_f16_f32(c_frag, a_frag, b_frag, c_frag);
             }
 
-            S_regs[j * 4 + 0] = c_frag.x[0];  // row group, cols j*8+ltid*2
-            S_regs[j * 4 + 1] = c_frag.x[1];  // row group, cols j*8+ltid*2+1
-            S_regs[j * 4 + 2] = c_frag.x[2];  // row group+8
-            S_regs[j * 4 + 3] = c_frag.x[3];  // row group+8
+            S_regs[j * 4 + 0] = c_frag.x[0];
+            S_regs[j * 4 + 1] = c_frag.x[1];
+            S_regs[j * 4 + 2] = c_frag.x[2];
+            S_regs[j * 4 + 3] = c_frag.x[3];
+        }
+
+        // ===== Load V transposed (sync vectorized) while QK^T just finished =====
+        const half* V_src = V + (batch_head * seq_len + k_start) * HEAD_DIM;
+        int v_valid = (k_start + TILE_N <= seq_len) ? TILE_N : (seq_len - k_start);
+        copy_global_to_smem_transposed_vec<HEAD_DIM, VT_STRIDE, TILE_N>(smem_VT, V_src, tid, blockDim.x, v_valid);
+
+        // ===== cp.async prefetch K[next] into alternate buffer =====
+        if (k_block + 1 < num_k_blocks)
+        {
+            int k_start_nxt = (k_block + 1) * TILE_N;
+            const half* K_src_nxt = K + (batch_head * seq_len + k_start_nxt) * HEAD_DIM;
+            int k_valid_nxt = (k_start_nxt + TILE_N <= seq_len) ? TILE_N : (seq_len - k_start_nxt);
+            cp_async_global_to_smem_vec<HEAD_DIM, K_STRIDE, TILE_N>(smem_K_nxt, K_src_nxt, tid, blockDim.x, k_valid_nxt);
+            cp_async_commit();
         }
 
         // ===== Softmax: register-based with quad_allreduce =====
+        // (pure register ALU — overlaps with V load + K prefetch in background)
 
         // 1. Scale and find max for each row (r0=group, r1=group+8)
         float max_r0 = -1e10f, max_r1 = -1e10f;
@@ -5261,7 +5371,10 @@ inline CUDA_CALLABLE void flash_attention_mma_kernel(
         m_r0 = m_new_r0;
         m_r1 = m_new_r1;
 
-        // ===== PV GEMM: A from registers, B from SMEM V =====
+        // ===== Sync: ensure V transposed is visible to all warps =====
+        __syncthreads();
+
+        // ===== PV GEMM: A from registers, B from SMEM VT (transposed, col-major access) =====
         WP_PRAGMA_UNROLL
         for (int h = 0; h < HD_TILES; h++)
         {
@@ -5288,8 +5401,8 @@ inline CUDA_CALLABLE void flash_attention_mma_kernel(
                 a_frag.x[3] = mma_pack_half2(float_to_half(S_regs[sj1 * 4 + 2]),
                                              float_to_half(S_regs[sj1 * 4 + 3]));
 
-                // B from SMEM V (row-major, with padded stride)
-                load_mma_frag_b_from_rowmajor(b_frag, smem_V, s * 16, h * 8, V_STRIDE);
+                // B from SMEM VT: VT[d, n] stored at d * VT_STRIDE + n (col-major for MMA)
+                load_mma_frag_b_colmajor(b_frag, smem_VT, s * 16, h * 8, VT_STRIDE);
 
                 mma_m16n8k16_f16_f32(c_frag, a_frag, b_frag, c_frag);
             }
@@ -5300,7 +5413,12 @@ inline CUDA_CALLABLE void flash_attention_mma_kernel(
             O_regs[h * 4 + 3] = c_frag.x[3];
         }
 
-        __syncthreads();  // Ensure all warps done reading K/V before next iteration overwrites
+        // ===== Wait for K[next] cp.async and sync =====
+        if (k_block + 1 < num_k_blocks)
+        {
+            cp_async_wait_group<0>();
+        }
+        __syncthreads();
     }
 
     // ===== Final output: write from registers to global memory =====
