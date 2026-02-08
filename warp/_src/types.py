@@ -4242,24 +4242,13 @@ class tile(Tile[DType, Shape]):
 
         self.owner = owner
 
-        # RMEM metadata (backfilled by tile_matmul dispatch when storage="register" is used as accumulator)
-        self.rmem_storage_bytes = 0
-        self.rmem_logical_size = 0
-        self.rmem_meta = None
-        # Set to True when this tile should remain in registers for RMEM accumulation.
-        # tile_matmul checks this to decide between RMEM vs shared output path.
-        self._rmem_hint = False
 
     # generates C-type string
     def ctype(self):
         from warp._src.codegen import Var  # noqa: PLC0415
 
         if self.storage == "register":
-            if self.rmem_storage_bytes > 0:
-                # cuBLASDx opaque register tile (rmem_storage_bytes backfilled by tile_matmul dispatch)
-                return f"wp::tile_rmem_t<{self.rmem_storage_bytes}>"
-            else:
-                return f"wp::tile_register_t<{Var.type_to_ctype(self.dtype)},wp::tile_layout_register_t<wp::tile_shape_t<{','.join(map(str, self.shape))}>>>"
+            return f"wp::tile_register_t<{Var.type_to_ctype(self.dtype)},wp::tile_layout_register_t<wp::tile_shape_t<{','.join(map(str, self.shape))}>>>"
         elif self.storage == "shared":
             return f"wp::tile_shared_t<{Var.type_to_ctype(self.dtype)},wp::tile_layout_strided_t<wp::tile_shape_t<{','.join(map(str, self.shape))}>, wp::tile_stride_t<{','.join(map(str, self.strides))}>>, {'true' if self.owner else 'false'}>"
         elif self.storage == "mma_acc":

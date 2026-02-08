@@ -452,7 +452,7 @@ def create_flash_attention_smem2_kernel(head_dim: int, tile_m: int = 128, tile_n
     """Flash attention with tensor-core PV using SMEM O accumulator.
 
     Uses tile_matmul for BOTH QK^T and PV. The O accumulator stays in shared
-    memory, avoiding cuBLASDx RMEM layout-transform overhead.
+    memory.
 
     Per k_block:
       1. tile_matmul(Q, K^T, S_tile)    — tensor cores for QK^T
@@ -582,135 +582,6 @@ def get_smem2_kernel(head_dim: int, tile_m: int = None, tile_n: int = None,
     if key not in _smem2_kernel_cache:
         _smem2_kernel_cache[key] = create_flash_attention_smem2_kernel(head_dim, tile_m, tile_n, block_dim)
     return _smem2_kernel_cache[key]
-
-
-def create_flash_attention_rmem_kernel(head_dim: int, tile_m: int = 128, tile_n: int = 64,
-                                        block_dim: int = 128):
-    """Flash attention with RMEM PV accumulation via cuBLASDx Tensor API.
-
-    Uses tile_matmul (SMEM) for QK^T and tile_matmul (RMEM) for PV.
-    The O accumulator lives in register memory (cuBLASDx SUGGESTED_RMEM_C),
-    avoiding shared memory round-trips per K-block.
-
-    tile_matmul automatically detects storage="register" on the output tile
-    and dispatches to the RMEM path. tile_scale and tile_copy provide
-    generic element-wise scaling and rmem→shared copy.
-
-    Args:
-        head_dim: Head dimension (32, 64, 128, 256)
-        tile_m: Query block size
-        tile_n: Key/Value block size
-        block_dim: Thread block size
-    """
-
-    @wp.kernel(enable_backward=False)
-    def flash_attention_rmem_kernel(
-        Q: wp.array3d(dtype=wp.float16),
-        K: wp.array3d(dtype=wp.float16),
-        V: wp.array3d(dtype=wp.float16),
-        O: wp.array3d(dtype=wp.float16),
-        sm_scale: float,
-        seq_len: int,
-        batch_heads: int,
-        num_q_blocks: int,
-        num_k_blocks: int,
-    ):
-        TILE_M = wp.static(tile_m)
-        TILE_N = wp.static(tile_n)
-        HEAD_DIM = wp.static(head_dim)
-
-        # Thread indexing: block_dim threads per tile block
-        tile_idx = wp.tid() // TILE_M
-        row_in_tile = wp.tid() % TILE_M
-
-        batch_head = tile_idx // num_q_blocks
-        q_block_idx = tile_idx % num_q_blocks
-        q_start = q_block_idx * TILE_M
-        q_row = q_start + row_in_tile
-
-        if batch_head >= batch_heads:
-            return
-        if q_row >= seq_len:
-            return
-
-        sm_scale_log2 = sm_scale * 1.44269504
-
-        # Load Q block as tile (reused across all K/V blocks)
-        Q_tile_3d = wp.tile_load(Q, shape=(1, TILE_M, HEAD_DIM), offset=(batch_head, q_start, 0))
-        Q_tile = wp.tile_squeeze(Q_tile_3d, axis=(0,))
-
-        # Per-thread softmax state (FP32 registers)
-        m_i = float(-1e10)
-        l_i = float(0.0)
-
-        # O accumulator in register memory — rmem_storage_bytes determined by tile_matmul dispatch
-        # accumulator=TILE_N specifies K dimension for the PV matmul: S[M,N] @ V[N,D] → O[M,D]
-        O_acc = wp.tile_zeros(shape=(TILE_M, HEAD_DIM), dtype=wp.float16, storage="register", accumulator=TILE_N)
-
-        for k_block in range(num_k_blocks):
-            k_start = k_block * TILE_N
-
-            # Load K/V blocks
-            K_tile_3d = wp.tile_load(K, shape=(1, TILE_N, HEAD_DIM), offset=(batch_head, k_start, 0))
-            K_tile = wp.tile_squeeze(K_tile_3d, axis=(0,))
-            V_tile_3d = wp.tile_load(V, shape=(1, TILE_N, HEAD_DIM), offset=(batch_head, k_start, 0))
-            V_tile = wp.tile_squeeze(V_tile_3d, axis=(0,))
-
-            # S = Q @ K^T via tensor cores [TILE_M, TILE_N] — shared output for element access
-            K_T = wp.tile_transpose(K_tile)
-            S_tile = wp.tile_zeros(shape=(TILE_M, TILE_N), dtype=wp.float16, storage="shared")
-            wp.tile_matmul(Q_tile, K_T, S_tile)
-
-            # Per-thread scalar online softmax
-            m_block = float(-1e10)
-            for n in range(TILE_N):
-                s = float(S_tile[row_in_tile, n]) * sm_scale_log2
-                m_block = wp.max(m_block, s)
-
-            m_new = wp.max(m_i, m_block)
-            alpha = wp.exp2(m_i - m_new)
-
-            # Rescale O accumulator and running sum
-            l_i = l_i * alpha
-            wp.tile_scale(O_acc, alpha)
-
-            # Write P values to S_tile (reuse for PV matmul), accumulate l_i
-            for n in range(TILE_N):
-                s = float(S_tile[row_in_tile, n]) * sm_scale_log2
-                p = wp.exp2(s - m_new)
-                l_i = l_i + p
-                S_tile[row_in_tile, n] = wp.float16(p)
-
-            wp.tile_sync()
-
-            # PV accumulation via tensor cores: O_acc += S_tile @ V_tile (RMEM path)
-            wp.tile_matmul(S_tile, V_tile, O_acc)
-
-            m_i = m_new
-
-        # Copy register → shared for output
-        O_shared = wp.tile_copy(O_acc)
-
-        # Final normalization and write output (FP32 -> FP16)
-        for d in range(HEAD_DIM):
-            O[batch_head, q_row, d] = wp.float16(float(O_shared[row_in_tile, d]) / l_i)
-
-    return flash_attention_rmem_kernel
-
-
-def get_flash_attention_rmem_kernel(head_dim: int, tile_m: int = 128, tile_n: int = 64,
-                                     block_dim: int = 128):
-    """Get or create RMEM flash attention kernel.
-
-    Currently uses scalar PV (same as non-RMEM kernel) as a stepping stone.
-    RMEM tensor-core PV accumulation will be integrated once LTO pipeline is validated.
-    """
-    key = ("flash_rmem", head_dim, tile_m, tile_n, block_dim)
-    if key not in _kernel_cache:
-        if head_dim not in SUPPORTED_HEAD_DIMS:
-            raise ValueError(f"head_dim={head_dim} not supported. Use one of {SUPPORTED_HEAD_DIMS}")
-        _kernel_cache[key] = create_flash_attention_rmem_kernel(head_dim, tile_m, tile_n, block_dim)
-    return _kernel_cache[key]
 
 
 def create_flash_attention_mma_kernel(head_dim: int, tile_m: int = 128, tile_n: int = 64,
@@ -867,43 +738,6 @@ if __name__ == "__main__":
         print(f"  Flash:      err={err:.2e} [{status}]")
         if status == "FAIL":
             all_passed = False
-
-        # Test RMEM flash attention kernel (tile_matmul PV in register memory)
-        if head_dim == 64:  # RMEM kernel currently validated for head_dim=64
-            rmem_tile_m = 128
-            rmem_tile_n = 64
-            rmem_block_dim = 128
-
-            rmem_kernel = get_flash_attention_rmem_kernel(head_dim, rmem_tile_m, rmem_tile_n, rmem_block_dim)
-            rmem_padded_seq = ((seq_len + rmem_tile_m - 1) // rmem_tile_m) * rmem_tile_m
-            rmem_num_q_blocks = rmem_padded_seq // rmem_tile_m
-            rmem_num_k_blocks = rmem_padded_seq // rmem_tile_n
-
-            Q_rmem_np = np.zeros((batch_heads, rmem_padded_seq, head_dim), dtype=np.float16)
-            K_rmem_np = np.zeros((batch_heads, rmem_padded_seq, head_dim), dtype=np.float16)
-            V_rmem_np = np.zeros((batch_heads, rmem_padded_seq, head_dim), dtype=np.float16)
-            Q_rmem_np[:, :seq_len, :] = Q_np.astype(np.float16)
-            K_rmem_np[:, :seq_len, :] = K_np.astype(np.float16)
-            V_rmem_np[:, :seq_len, :] = V_np.astype(np.float16)
-
-            Q_rmem = wp.array(Q_rmem_np, dtype=wp.float16)
-            K_rmem = wp.array(K_rmem_np, dtype=wp.float16)
-            V_rmem = wp.array(V_rmem_np, dtype=wp.float16)
-            O_rmem = wp.zeros_like(Q_rmem)
-
-            rmem_total_threads = batch_heads * rmem_num_q_blocks * rmem_tile_m
-            wp.launch(
-                rmem_kernel,
-                dim=rmem_total_threads,
-                inputs=[Q_rmem, K_rmem, V_rmem, O_rmem, sm_scale, rmem_padded_seq, batch_heads, rmem_num_q_blocks, rmem_num_k_blocks],
-                block_dim=rmem_block_dim,
-            )
-            O_rmem_result = O_rmem.numpy()[:, :seq_len, :].astype(np.float32)
-            err = np.max(np.abs(O_rmem_result - ref_out))
-            status = "PASS" if err < 0.2 else "FAIL"  # RMEM uses tensor-core PV, fp16 precision
-            print(f"  Flash RMEM: err={err:.2e} [{status}]")
-            if status == "FAIL":
-                all_passed = False
 
     print("\n" + "=" * 60)
     print(f"Result: {'ALL PASSED' if all_passed else 'SOME FAILED'}")

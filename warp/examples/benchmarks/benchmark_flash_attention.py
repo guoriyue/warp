@@ -50,7 +50,6 @@ sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
 from tile.example_tile_flash_attention import (
     get_naive_kernel,
     create_flash_attention_kernel,
-    create_flash_attention_rmem_kernel,
     get_matmul_only_kernel,
     get_flash_attention_mma_kernel,
 )
@@ -101,30 +100,7 @@ def get_flash_kernel(head_dim: int, tile_m: int = None, tile_n: int = None,
         _flash_kernel_cache[key] = create_flash_attention_kernel(head_dim, tile_m, tile_n, threads_per_row)
     return _flash_kernel_cache[key]
 
-# Cache for RMEM flash kernels
-_rmem_kernel_cache = {}
-
-
-def compute_rmem_config(head_dim: int):
-    """Compute (tile_m, tile_n, block_dim) for RMEM kernel."""
-    tile_m = 128
-    tile_n = 64
-    block_dim = tile_m  # No threads_per_row; tensor cores handle D parallelism
-    return tile_m, tile_n, block_dim
-
-
-def get_rmem_kernel(head_dim: int, tile_m: int = None, tile_n: int = None,
-                    block_dim: int = None):
-    """Get or create RMEM flash attention kernel."""
-    if tile_m is None or tile_n is None or block_dim is None:
-        tile_m, tile_n, block_dim = compute_rmem_config(head_dim)
-    key = (head_dim, tile_m, tile_n, block_dim)
-    if key not in _rmem_kernel_cache:
-        _rmem_kernel_cache[key] = create_flash_attention_rmem_kernel(head_dim, tile_m, tile_n, block_dim)
-    return _rmem_kernel_cache[key]
-
-
-ALL_IMPLEMENTATIONS = ["naive", "wp_flash_attn", "wp_matmul_only", "wp_flash_rmem", "wp_flash_mma"]
+ALL_IMPLEMENTATIONS = ["naive", "wp_flash_attn", "wp_matmul_only", "wp_flash_mma"]
 if HAS_TRITON:
     ALL_IMPLEMENTATIONS.append("triton")
 if HAS_FLASH_ATTN:
@@ -165,21 +141,6 @@ def launch_kernel(impl: str, Q: wp.array, K: wp.array, V: wp.array, O: wp.array,
         num_q_blocks = (seq_len + tile_m - 1) // tile_m
         num_k_blocks = (seq_len + tile_n - 1) // tile_n
         block_dim = tile_m * threads_per_row
-        total_threads = batch_heads * num_q_blocks * block_dim
-        wp.launch(
-            kernel,
-            dim=total_threads,
-            inputs=[Q, K, V, O, sm_scale, seq_len, batch_heads, num_q_blocks, num_k_blocks],
-            block_dim=block_dim,
-        )
-    elif impl == "wp_flash_rmem":
-        cfg_tile_m, cfg_tile_n, cfg_block_dim = compute_rmem_config(head_dim)
-        tile_m = tile_m or cfg_tile_m
-        tile_n = tile_n or cfg_tile_n
-        block_dim = cfg_block_dim
-        kernel = get_rmem_kernel(head_dim, tile_m, tile_n, block_dim)
-        num_q_blocks = (seq_len + tile_m - 1) // tile_m
-        num_k_blocks = (seq_len + tile_n - 1) // tile_n
         total_threads = batch_heads * num_q_blocks * block_dim
         wp.launch(
             kernel,
@@ -265,38 +226,6 @@ def benchmark(batch: int, heads: int, seq_len: int, impl: str, head_dim: int = 6
             timings.append((time.perf_counter() - start) * 1000)
 
         O_out = O_torch.float().cpu().numpy().reshape(shape)
-        error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
-        return mean(timings), error, O_out
-
-    # Handle wp_flash_rmem kernel (fp16 - needs padded arrays)
-    if impl == "wp_flash_rmem":
-        tile_m, tile_n, _ = compute_rmem_config(head_dim)
-        padded_seq = ((seq_len + tile_m - 1) // tile_m) * tile_m
-
-        Q_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        K_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        V_padded = np.zeros((batch_heads, padded_seq, head_dim), dtype=np.float16)
-        Q_padded[:, :seq_len, :] = Q_np.astype(np.float16)
-        K_padded[:, :seq_len, :] = K_np.astype(np.float16)
-        V_padded[:, :seq_len, :] = V_np.astype(np.float16)
-
-        Q = wp.array(Q_padded, dtype=wp.float16)
-        K = wp.array(K_padded, dtype=wp.float16)
-        V = wp.array(V_padded, dtype=wp.float16)
-        O = wp.zeros_like(Q)
-
-        for _ in range(warmup):
-            launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
-        wp.synchronize()
-
-        timings = []
-        for _ in range(iterations):
-            start = time.perf_counter()
-            launch_kernel(impl, Q, K, V, O, sm_scale, head_dim)
-            wp.synchronize()
-            timings.append((time.perf_counter() - start) * 1000)
-
-        O_out = O.numpy()[:, :seq_len, :].astype(np.float32)
         error = np.max(np.abs(O_out - ref_out)) if ref_out is not None else 0.0
         return mean(timings), error, O_out
 
@@ -509,8 +438,6 @@ def main():
         print(f"  wp_flash_attn head_dim={hd}: tile_m={tm}, tile_n={tn}, threads_per_row={tpr}, "
               f"d_per_thread=8, block_dim={block_dim} ({block_dim//32}w), smem={smem//1024}KB")
         print(f"  wp_matmul_only head_dim={hd}: (same config, QK^T only, no PV loop)")
-        rtm, rtn, rbd = compute_rmem_config(hd)
-        print(f"  wp_flash_rmem head_dim={hd}: tile_m={rtm}, tile_n={rtn}, block_dim={rbd} ({rbd//32}w)")
 
     run_scaling_benchmarks()
 

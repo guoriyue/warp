@@ -503,32 +503,6 @@ WP_API bool wp_cuda_compile_dot(
     int arrangement_C,
     int num_threads
 );
-WP_API bool wp_cuda_compile_dot_rmem(
-    const char* ltoir_output_path,
-    const char* symbol_prefix,
-    int num_include_dirs,
-    const char** include_dirs,
-    const char* mathdx_include_dir,
-    int arch,
-    int M,
-    int N,
-    int K,
-    int precision_A,
-    int precision_B,
-    int precision_C,
-    int type,
-    int arrangement_A,
-    int arrangement_B,
-    int num_threads,
-    // output metadata
-    int* rmem_storage_bytes,
-    int* rmem_logical_size,
-    int* smem_a_storage_bytes,
-    int* smem_b_storage_bytes,
-    int* smem_c_storage_bytes,
-    int* smem_a_sugg_storage_bytes,
-    int* smem_b_sugg_storage_bytes
-);
 WP_API bool wp_cuda_compile_solver(
     const char* fatbin_output_path,
     const char* ltoir_output_path,

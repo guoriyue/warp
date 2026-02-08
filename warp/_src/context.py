@@ -4655,31 +4655,6 @@ class Runtime:
             ]
             self.core.wp_cuda_compile_dot.restype = ctypes.c_bool
 
-            self.core.wp_cuda_compile_dot_rmem.argtypes = [
-                ctypes.c_char_p,  # lto output path
-                ctypes.c_char_p,  # symbol prefix
-                ctypes.c_int,  # num include dirs
-                ctypes.POINTER(ctypes.c_char_p),  # include dirs
-                ctypes.c_char_p,  # mathdx include dir
-                ctypes.c_int,  # arch
-                ctypes.c_int,  # M
-                ctypes.c_int,  # N
-                ctypes.c_int,  # K
-                ctypes.c_int,  # a_precision
-                ctypes.c_int,  # b_precision
-                ctypes.c_int,  # c_precision
-                ctypes.c_int,  # type
-                ctypes.c_int,  # a_arrangement
-                ctypes.c_int,  # b_arrangement
-                ctypes.c_int,  # num threads
-                ctypes.POINTER(ctypes.c_int),  # rmem_storage_bytes
-                ctypes.POINTER(ctypes.c_int),  # rmem_logical_size
-                ctypes.POINTER(ctypes.c_int),  # smem_a_storage_bytes
-                ctypes.POINTER(ctypes.c_int),  # smem_b_storage_bytes
-                ctypes.POINTER(ctypes.c_int),  # smem_c_storage_bytes
-            ]
-            self.core.wp_cuda_compile_dot_rmem.restype = ctypes.c_bool
-
             self.core.wp_cuda_compile_solver.argtypes = [
                 ctypes.c_char_p,  # universal fatbin
                 ctypes.c_char_p,  # lto

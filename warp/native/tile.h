@@ -600,23 +600,6 @@ template <typename Shape_> struct tile_layout_register_t {
     }
 };
 
-// Opaque register-memory tile for cuBLASDx Tensor API RMEM accumulator.
-// StorageBytes is determined at LTO build time by querying CUBLASDX_TENSOR_TRAIT_STORAGE_BYTES.
-// The layout is opaque; only cuBLASDx device functions can read/write the data.
-// The tile_matmul_rmem, tile_rmem_copy, tile_rmem_scale macros (below) handle the actual operations.
-template <int StorageBytes>
-struct tile_rmem_t {
-    alignas(16) char buf[StorageBytes];
-
-    // Accept any scalar assignment (e.g. from tile_zeros which returns T{}).
-    // Zero-initializes the opaque buffer; for fp16/fp32 zero bits == 0.0.
-    template <typename T>
-    inline CUDA_CALLABLE tile_rmem_t& operator=(const T&) {
-        memset(buf, 0, StorageBytes);
-        return *this;
-    }
-};
-
 // represents a tile stored in registers across a block
 template <typename T, typename L> struct tile_register_t {
     using Type = T;
@@ -5628,16 +5611,6 @@ void adj_tile_matmul(
 #define adj_tile_fft()
 #define adj_tile_ifft()
 
-// RMEM stubs for CPU
-#define tile_rmem_clear(fn_clear, var_out)
-#define adj_tile_rmem_clear(fn_clear, var_out, adj_fn_clear, adj_var_out)
-#define tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes)
-#define adj_tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, adj_fn_copy_a, adj_fn_copy_b, adj_fn_execute, adj_A, adj_B, adj_var_C, adj_smem_a_sugg_bytes, adj_smem_b_sugg_bytes)
-#define tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size)
-#define adj_tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size, adj_fn_map, adj_fn_bounds, adj_var_C, adj_alpha, adj_logical_size)
-#define tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size)
-#define adj_tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size, adj_fn_map, adj_fn_bounds, adj_var_src, adj_var_dst, adj_logical_size)
-
 // Native MMA stubs for CPU
 #define tile_mma_smem(A, B, C)
 #define adj_tile_mma_smem(A, B, C, adj_A, adj_B, adj_C)
@@ -5688,130 +5661,6 @@ void adj_tile_matmul(
      do { \
          tile_fft(function_name, dtype, shared_memory_size, batch_size, ept, adj_Xinout); \
      } while (0)
-
-// ============================================================================
-// RMEM tile macros (cuBLASDx Tensor API)
-// ============================================================================
-// tensor_t for cuBLASDx Tensor API: struct { void* ptr; }
-struct tile_rmem_tensor_t { void* ptr; };
-
-// tile_rmem_clear: call LTO clear on the rmem tile
-#define tile_rmem_clear(fn_clear, var_out) \
-    do { \
-        void fn_clear(tile_rmem_tensor_t); \
-        tile_rmem_tensor_t _tc = { var_out.buf }; \
-        fn_clear(_tc); \
-    } while (0)
-
-#define adj_tile_rmem_clear(fn_clear, var_out, adj_fn_clear, adj_var_out)
-
-// tile_matmul_rmem: C_rmem += A_smem @ B_smem
-// First copies A,B from plain SMEM layout to suggested SMEM layout (separate buffers),
-// then executes matmul. The copy functions rearrange data from the user's tile_load layout
-// to cuBLASDx's optimal layout. Temporary shared memory is allocated for the suggested copies.
-#define tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes) \
-    do { \
-        void fn_copy_a(tile_rmem_tensor_t, tile_rmem_tensor_t); \
-        void fn_copy_b(tile_rmem_tensor_t, tile_rmem_tensor_t); \
-        void fn_execute(tile_rmem_tensor_t, tile_rmem_tensor_t, tile_rmem_tensor_t); \
-        char* _buf_a_sugg = (char*)wp::tile_shared_storage_t::alloc(smem_a_sugg_bytes); \
-        char* _buf_b_sugg = (char*)wp::tile_shared_storage_t::alloc(smem_b_sugg_bytes); \
-        tile_rmem_tensor_t _ta_plain = { A.data.ptr }; \
-        tile_rmem_tensor_t _tb_plain = { B.data.ptr }; \
-        tile_rmem_tensor_t _ta_sugg = { _buf_a_sugg }; \
-        tile_rmem_tensor_t _tb_sugg = { _buf_b_sugg }; \
-        fn_copy_a(_ta_plain, _ta_sugg); \
-        fn_copy_b(_tb_plain, _tb_sugg); \
-        WP_TILE_SYNC(); \
-        tile_rmem_tensor_t _tc = { var_C.buf }; \
-        fn_execute(_ta_sugg, _tb_sugg, _tc); \
-        WP_TILE_SYNC(); \
-        wp::tile_shared_storage_t::alloc(-(smem_a_sugg_bytes)); \
-        wp::tile_shared_storage_t::alloc(-(smem_b_sugg_bytes)); \
-    } while (0)
-
-#define adj_tile_matmul_rmem(fn_copy_a, fn_copy_b, fn_execute, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, \
-    adj_fn_copy_a, adj_fn_copy_b, adj_fn_execute, adj_A, adj_B, adj_var_C, adj_smem_a_sugg_bytes, adj_smem_b_sugg_bytes)
-
-// tile_matmul_rmem_beta: C_rmem = A_smem @ B_smem + beta * C_rmem
-// Same as tile_matmul_rmem but with beta scaling of accumulator before execute.
-// Uses AXPBY (D = alpha*C + beta*D) with alpha=0 to scale C_rmem by beta first.
-// This is the standard GEMM equation: C = alpha*A@B + beta*C (with alpha=1 for matmul).
-#define tile_matmul_rmem_beta(fn_copy_a, fn_copy_b, fn_execute, fn_axpby, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, beta) \
-    do { \
-        void fn_copy_a(tile_rmem_tensor_t, tile_rmem_tensor_t); \
-        void fn_copy_b(tile_rmem_tensor_t, tile_rmem_tensor_t); \
-        void fn_execute(tile_rmem_tensor_t, tile_rmem_tensor_t, tile_rmem_tensor_t); \
-        void fn_axpby(void*, tile_rmem_tensor_t, void*, tile_rmem_tensor_t); \
-        char* _buf_a_sugg = (char*)wp::tile_shared_storage_t::alloc(smem_a_sugg_bytes); \
-        char* _buf_b_sugg = (char*)wp::tile_shared_storage_t::alloc(smem_b_sugg_bytes); \
-        tile_rmem_tensor_t _ta_plain = { A.data.ptr }; \
-        tile_rmem_tensor_t _tb_plain = { B.data.ptr }; \
-        tile_rmem_tensor_t _ta_sugg = { _buf_a_sugg }; \
-        tile_rmem_tensor_t _tb_sugg = { _buf_b_sugg }; \
-        fn_copy_a(_ta_plain, _ta_sugg); \
-        fn_copy_b(_tb_plain, _tb_sugg); \
-        WP_TILE_SYNC(); \
-        tile_rmem_tensor_t _tc = { var_C.buf }; \
-        /* Skip AXPBY when beta=1.0 (identity operation) to avoid overhead */ \
-        if (static_cast<float>(beta) != 1.0f) { \
-            wp::float16 _alpha_val = wp::float16(0.0f); \
-            wp::float16 _beta_val = wp::float16(static_cast<float>(beta)); \
-            fn_axpby(&_alpha_val, _tc, &_beta_val, _tc); \
-        } \
-        fn_execute(_ta_sugg, _tb_sugg, _tc); \
-        WP_TILE_SYNC(); \
-        wp::tile_shared_storage_t::alloc(-(smem_a_sugg_bytes)); \
-        wp::tile_shared_storage_t::alloc(-(smem_b_sugg_bytes)); \
-    } while (0)
-
-#define adj_tile_matmul_rmem_beta(fn_copy_a, fn_copy_b, fn_execute, fn_axpby, A, B, var_C, smem_a_sugg_bytes, smem_b_sugg_bytes, beta, \
-    adj_fn_copy_a, adj_fn_copy_b, adj_fn_execute, adj_fn_axpby, adj_A, adj_B, adj_var_C, adj_smem_a_sugg_bytes, adj_smem_b_sugg_bytes, adj_beta)
-
-// tile_rmem_scale: element-wise scale RMEM tile
-// For scalar multiplication, we can directly iterate over the raw buffer
-// since fp16 * scalar is element-wise regardless of layout.
-// Skip scaling when alpha is very close to 1.0 (common in online softmax).
-#define tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size) \
-    do { \
-        wp::float32 _alpha32 = static_cast<wp::float32>(alpha); \
-        /* Early exit if alpha is close to 1.0 (common when max doesn't change) */ \
-        if (_alpha32 < 0.99999f || _alpha32 > 1.00001f) { \
-            wp::float16* _buf = reinterpret_cast<wp::float16*>(var_C.buf); \
-            _Pragma("unroll") \
-            for (int _i = 0; _i < (int)(logical_size); _i++) { \
-                _buf[_i] = wp::float16(static_cast<wp::float32>(_buf[_i]) * _alpha32); \
-            } \
-        } \
-    } while (0)
-
-#define adj_tile_rmem_scale(fn_map, fn_bounds, var_C, alpha, logical_size, \
-    adj_fn_map, adj_fn_bounds, adj_var_C, adj_alpha, adj_logical_size)
-
-// tile_rmem_copy: copy RMEM tile to shared memory tile using MAP_IDX2CRD
-// Uses element-wise access to handle the layout mismatch between RMEM and strided shared tiles.
-#define tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size) \
-    do { \
-        void fn_map(tile_rmem_tensor_t, int*, int*, int*, void**); \
-        void fn_bounds(int*, int*); \
-        tile_rmem_tensor_t _tc = { var_src.buf }; \
-        for (int _idx = 0; _idx < (int)(logical_size); _idx++) { \
-            int _in_bounds = 0; \
-            fn_bounds(&_idx, &_in_bounds); \
-            if (!_in_bounds) continue; \
-            int _i, _j; \
-            void* _elem_ptr = nullptr; \
-            fn_map(_tc, &_idx, &_i, &_j, &_elem_ptr); \
-            if (_elem_ptr) { \
-                wp::float16* _p = static_cast<wp::float16*>(_elem_ptr); \
-                var_dst.data(wp::tile_coord_t<2>{_i, _j}) = *_p; \
-            } \
-        } \
-        WP_TILE_SYNC(); \
-    } while (0)
-
-#define adj_tile_rmem_copy(fn_map, fn_bounds, var_src, var_dst, logical_size, \
-    adj_fn_map, adj_fn_bounds, adj_var_src, adj_var_dst, adj_logical_size)
 
 // ============================================================================
 // Native MMA macros (GPU path) — called by codegen via override_native_func
